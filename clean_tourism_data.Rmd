@@ -1,0 +1,258 @@
+---
+title: "Cleaning"
+output: "Łucja Wuls"
+date: "2025-11-02"
+---
+
+# Wstęp
+
+Celem tego notebooka jest przygotowanie uporządkowanego, możliwie kompletnego zbioru danych na potrzeby dalszej analizy zależności między ruchem turystycznym a wskaźnikami makroekonomicznymi.
+Pracujemy na pliku wejściowym `world_tourism_economy_data.csv` zapisanym w katalogu `data/raw` i zapisujemy wyczyszczoną wersję jako `world_tourism_economy_data_clean.csv` w katalogu `data/clean`.
+
+# Przygotowanie środowiska
+
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+# Ładujemy pakiety, których będziemy używać.
+# tidyverse: dplyr, readr, ggplot2 itd. do pracy z danymi.
+# janitor: wygodna funkcja clean_names do standaryzacji nazw kolumn.
+# zoo: funkcja na.approx do interpolacji braków danych w szeregu czasowym.
+
+library(tidyverse)
+library(janitor)
+library(zoo)
+```
+
+# Wczytanie danych
+
+```{r}
+# Ścieżka do pliku surowego.
+raw_path <- "data/raw/world_tourism_economy_data.csv"
+
+# Wczytanie danych csv.
+# show_col_types = FALSE, aby nie zaśmiecać konsoli komunikatami o typach.
+tourism_raw <- readr::read_csv(raw_path, show_col_types = FALSE)
+
+# Podgląd pierwszych wierszy.
+head(tourism_raw)
+```
+
+```{r}
+# Szybka struktura danych: pozwala sprawdzić typy kolumn i ogólny kształt tabeli.
+glimpse(tourism_raw)
+```
+
+# Standaryzacja nazw kolumn
+
+```{r}
+# Standaryzujemy nazwy kolumn (małe litery, snake_case).
+
+tourism_clean <- tourism_raw %>%
+  janitor::clean_names()
+
+# Sprawdzamy wynik:
+names(tourism_clean)
+```
+
+# Identyfikacja kolumn i braków danych
+
+```{r}
+# Określamy, które kolumny traktujemy jako kluczowe:
+# id: identyfikatory jednostek i czasu,
+# measures: zmienne ilościowe związane z turystyką i gospodarką.
+
+id_vars <- c("country", "country_code", "year")
+
+measure_vars <- c(
+  "tourism_receipts",
+  "tourism_arrivals",
+  "tourism_exports",
+  "tourism_departures",
+  "tourism_expenditures",
+  "gdp",
+  "inflation",
+  "unemployment"
+)
+
+# Upewniamy się, że wszystkie wymienione kolumny istnieją:
+setdiff(measure_vars, names(tourism_clean))
+```
+
+```{r}
+# Obliczamy odsetek braków danych w każdej kolumnie, co pomoże podjąć decyzję, które zmienne imputować, a które zostawić z NA.
+
+missing_summary <- tourism_clean %>%
+  summarise(across(
+    .cols = all_of(measure_vars),
+    .fns = ~ mean(is.na(.)),
+    .names = "missing_{.col}"
+  )) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing_share"
+  ) %>%
+  arrange(desc(missing_share))
+
+missing_summary
+```
+
+# Sprawdzenie duplikatów
+
+```{r}
+# Sprawdzamy, czy pojawiają się duplikaty obserwacji dla kombinacji (country, year).
+# Dla analizy panelowej powinniśmy mieć co najwyżej jeden wiersz na kraj i rok.
+
+dups <- tourism_clean %>%
+  count(country, country_code, year, name = "n") %>%
+  filter(n > 1)
+
+dups
+```
+
+# Usuwanie wierszy całkowicie pustych w miarach
+
+```{r}
+# Tworzymy pomocniczą zmienną logiczną, która mówi, czy wszystkie miary (turystyka + gospodarka) są jednocześnie NA w danym wierszu.
+
+tourism_clean <- tourism_clean %>%
+  mutate(
+    all_measures_na = if_all(all_of(measure_vars), is.na)
+  )
+
+# Liczba takich wierszy:
+tourism_clean %>%
+  count(all_measures_na)
+
+# Usuwamy wiersze, w których wszystkie miary są NA, ponieważ nie wnoszą żadnej informacji do późniejszej analizy.
+
+tourism_clean <- tourism_clean %>%
+  filter(!all_measures_na) %>%
+  select(-all_measures_na)
+
+# Sprawdzamy liczbę wierszy po usunięciu:
+nrow(tourism_clean)
+```
+
+# Wybór strategii imputacji dla zmiennych ilościowych
+
+Założenia:
+- Zmienna `gdp` oraz podstawowe zmienne turystyczne (`tourism_receipts`, `tourism_arrivals`, `tourism_exports`, `tourism_expenditures`) są szeregiem czasowym w miarę gładkim w dłuższym okresie.
+- Uzupełnianie pojedynczych luk metodą interpolacji liniowej w obrębie danego kraju jest uzasadnione.
+- `inflation` również traktujemy jako serię czasową, ale dopuszczamy krótkie luki.
+- `tourism_departures` i `unemployment` mają relatywnie wysoki poziom braków – ich agresywna imputacja mogłaby zniekształcić dane, dlatego pozostawiamy je z NA.
+
+```{r}
+# Zmienne, dla których wykonamy interpolację liniową wewnątrz kraju.
+vars_to_interp <- c(
+  "tourism_receipts",
+  "tourism_arrivals",
+  "tourism_exports",
+  "tourism_expenditures",
+  "gdp",
+  "inflation"
+)
+
+# Dla bezpieczeństwa upewniamy się, że wszystkie te kolumny są numeryczne.
+tourism_clean <- tourism_clean %>%
+  mutate(
+    across(all_of(vars_to_interp), as.numeric)
+  )
+```
+
+# Interpolacja braków danych w czasie (wewnątrz kraju)
+
+```{r}
+# Wykonujemy interpolację liniową po roku osobno dla każdego kraju.
+# Używamy zoo::na.approx:
+# - x = year: interpolujemy względem roku, co jest ważne przy nierównych odstępach.
+# - na.rm = FALSE: nie usuwamy wierszy z samymi NA; przy braku wartości w całej serii
+#   kolumna pozostanie z NA.
+# - Domyślnie nie ekstrapolujemy poza zakres obserwacji z prawdziwymi danymi.
+
+tourism_clean <- tourism_clean %>%
+  group_by(country, country_code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    across(
+      .cols = all_of(vars_to_interp),
+      .fns  = ~ zoo::na.approx(
+        .,              # to jest object = wektor z danej kolumny
+        x    = year,    # oś czasu, po której interpolujemy
+        na.rm = FALSE   # nie wyrzucamy wierszy, tylko zostawiamy NA gdzie się nie da
+      )
+    )
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+# Sprawdzamy, jak zmienił się odsetek braków po interpolacji.
+missing_after <- tourism_clean %>%
+  summarise(across(
+    .cols = all_of(measure_vars),
+    .fns = ~ mean(is.na(.)),
+    .names = "missing_{.col}"
+  )) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing_share"
+  ) %>%
+  arrange(desc(missing_share))
+
+missing_after
+```
+
+# Porządkowanie tabeli i podstawowe sprawdzenia
+
+```{r}
+# Upewniamy się, że dane są uporządkowane według kraju i roku, co ułatwia dalsze analizy panelowe i prezentację.
+
+tourism_clean <- tourism_clean %>%
+  arrange(country, year)
+
+# Podgląd końcowej postaci tabeli.
+head(tourism_clean)
+```
+
+```{r}
+# Podsumowanie podstawowych statystyk opisowych dla wybranych zmiennych.
+summary(
+  tourism_clean %>%
+    select(all_of(measure_vars))
+)
+```
+
+# Zapis wyczyszczonego zbioru
+
+```{r}
+# Definiujemy ścieżkę do pliku wyjściowego.
+clean_path <- "data/clean/world_tourism_economy_data_clean.csv"
+
+# Na wszelki wypadek tworzymy katalog output, jeśli nie istnieje.
+dir.create(dirname(clean_path), recursive = TRUE, showWarnings = FALSE)
+
+# Zapisujemy dane w formacie CSV z separatorem przecinkowym.
+readr::write_csv(tourism_clean, clean_path)
+
+clean_path
+```
+
+# Podsumowanie
+
+W tym notebooku:
+- uporządkowaliśmy nazwy kolumn i sprawdziliśmy typy danych,
+- zidentyfikowaliśmy poziom braków danych w poszczególnych zmiennych,
+- usunęliśmy obserwacje, w których wszystkie miary turystyczne i makroekonomiczne były puste,
+- zastosowaliśmy interpolację liniową w czasie wewnątrz kraju dla wybranych zmiennych o umiarkowanym poziomie braków,
+- pozostawiliśmy silnie niekompletne zmienne (`tourism_departures`, `unemployment`) bez imputacji,
+- zapisaliśmy wyczyszczony zbiór danych do dalszej analizy.

@@ -1,0 +1,440 @@
+---
+title: "Eksploracyjna analiza danych – relacje i grupy krajów"
+author: "Twoje imię i nazwisko"
+date: "`r Sys.Date()`"
+editor_options:
+  markdown:
+    wrap: sentence
+output:
+  html_document:
+    df_print: paged
+---
+
+# Wstęp
+
+Celem tego notebooka jest zbadanie relacji między ruchem turystycznym a wskaźnikami makroekonomicznymi na poziomie krajów oraz próba wydzielenia grup krajów o podobnym profilu.
+W odróżnieniu od wcześniejszych części EDA, gdzie analizowaliśmy struktury danych, braki oraz dynamikę w czasie, tutaj koncentrujemy się na:
+
+- relacjach w przekroju krajów (poziomy i przeciętne dynamiki),
+- budowie „cech krajów” streszczających ich profil turystyczno-ekonomiczny,
+- podziale krajów na kilka grup (klastrów) o podobnych cechach.
+
+Takie grupy później można wykorzystać np. do porównania parametrów modeli między typami krajów (wysokorozwinięte gospodarki turystyczne vs kraje doganiające itd.).
+
+# Przygotowanie środowiska
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r packages}
+# tidyverse – operacje na danych i wykresy
+# scales – czytelne formatowanie osi (np. wartości w miliardach, procenty)
+# cluster, factoextra – prosta analiza skupień i wizualizacje klastrów
+
+library(tidyverse)
+library(scales)
+library(cluster)
+library(factoextra)
+
+# Ustawiamy spójny, minimalistyczny motyw dla wszystkich wykresów.
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Wczytanie danych i podstawowe przygotowanie
+
+```{r load-data}
+# Ścieżka do wyczyszczonego zbioru danych.
+clean_path <- "data/clean/world_tourism_economy_data_clean.csv"
+
+# Wczytanie danych.
+tourism <- readr::read_csv(clean_path, show_col_types = FALSE)
+
+# Kontrolny podgląd struktury.
+glimpse(tourism)
+```
+
+Komentarz:
+W kolejnych krokach będziemy operować na danych panelowych (kraj–rok), ale do budowy grup potrzebujemy zagregowanych cech dla krajów (średnie poziomy, przeciętne stopy wzrostu itd.).
+Dodatkowo sensowne jest ograniczenie analizy grup do okresu przed pandemią, aby „normalne” zachowanie nie było zaburzone ekstremalnym szokiem z 2020 roku.
+
+```{r filter-years}
+# Ograniczamy się do lat do 2019 włącznie,
+# tak aby grupy krajów opierały się na „typowym” okresie przed pandemią.
+
+tourism <- tourism %>%
+  filter(year <= 2019)
+
+range(tourism$year)
+```
+
+# Wyznaczenie dynamik rok do roku
+
+```{r growth-panel}
+# Tworzymy panel z obliczonymi stopami wzrostu rok do roku
+# dla kluczowych zmiennych: liczby przyjazdów, wpływów z turystyki i PKB.
+
+tourism_panel <- tourism %>%
+  arrange(country, country_code, year) %>%
+  group_by(country, country_code) %>%
+  mutate(
+    growth_arrivals  = (tourism_arrivals  - lag(tourism_arrivals))  / lag(tourism_arrivals),
+    growth_receipts  = (tourism_receipts  - lag(tourism_receipts))  / lag(tourism_receipts),
+    growth_gdp       = (gdp                - lag(gdp))              / lag(gdp)
+  ) %>%
+  ungroup()
+
+# Podgląd kilku pierwszych obserwacji.
+tourism_panel %>%
+  select(country, year, tourism_arrivals, growth_arrivals, gdp, growth_gdp) %>%
+  arrange(country, year) %>%
+  head(10)
+```
+
+Komentarz:
+Stopy wzrostu pozwolą nam później uwzględnić nie tylko poziom wskaźników (np. „bogaty kraj” vs „biedny kraj”), ale także ich przeciętną dynamikę („szybko rozwijający się” vs „stabilny”).
+
+# Budowa cech krajów (profil turystyczno-ekonomiczny)
+
+W tym kroku streszczamy dane panelowe do poziomu kraju.
+Dla każdego kraju obliczamy m.in.:
+
+- przeciętne poziomy liczby przyjazdów, wpływów z turystyki i PKB,
+- przeciętne wartości inflacji i bezrobocia,
+- przeciętne stopy wzrostu liczby przyjazdów, wpływów i PKB,
+- udział turystyki w PKB (średni udział wpływów z turystyki w PKB).
+
+```{r country-features}
+country_summary <- tourism_panel %>%
+  group_by(country, country_code) %>%
+  summarise(
+    # Liczba lat z danymi – przyda się do odfiltrowania krajów z bardzo krótkimi szeregami.
+    n_years          = n(),
+    n_arrivals       = sum(!is.na(tourism_arrivals)),
+    n_receipts       = sum(!is.na(tourism_receipts)),
+    n_gdp            = sum(!is.na(gdp)),
+    # Średnie poziomy zmiennych.
+    mean_arrivals    = mean(tourism_arrivals, na.rm = TRUE),
+    mean_receipts    = mean(tourism_receipts, na.rm = TRUE),
+    mean_gdp         = mean(gdp, na.rm = TRUE),
+    mean_inflation   = mean(inflation, na.rm = TRUE),
+    mean_unemployment= mean(unemployment, na.rm = TRUE),
+    # Przeciętne dynamiki.
+    mean_growth_arrivals = mean(growth_arrivals, na.rm = TRUE),
+    mean_growth_receipts = mean(growth_receipts, na.rm = TRUE),
+    mean_growth_gdp      = mean(growth_gdp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Średni udział turystyki w PKB – kluczowa cecha profilu kraju.
+  mutate(
+    tourism_share_gdp = mean_receipts / mean_gdp
+  )
+
+country_summary %>%
+  select(country, n_years, mean_arrivals, mean_receipts, mean_gdp, tourism_share_gdp) %>%
+  arrange(desc(mean_arrivals)) %>%
+  head(10)
+```
+
+Komentarz:
+Powstała tabela zawiera „cechy krajów”.
+Są to zmienne, na których będziemy opierać zarówno proste wykresy relacji (np. udział turystyki w PKB vs bezrobocie), jak i analizę skupień.
+
+# Filtrowanie krajów o bardzo niepełnych danych
+
+```{r filter-countries}
+# Usuwamy kraje, dla których praktycznie nie mamy danych – np. mniej niż 10 lat
+# obserwacji lub brak danych dla kluczowych zmiennych.
+# Progi można w razie potrzeby delikatnie skorygować.
+
+country_summary_filt <- country_summary %>%
+  filter(
+    n_arrivals >= 10,
+    n_receipts >= 10,
+    n_gdp >= 10,
+    !is.na(mean_arrivals),
+    !is.na(mean_receipts),
+    !is.na(mean_gdp),
+    mean_gdp > 0,
+    tourism_share_gdp > 0
+  )
+
+nrow(country_summary); nrow(country_summary_filt)
+```
+
+Komentarz:
+Dzięki filtrowaniu unikamy sytuacji, w której pojedyncze kraje z kilkoma latami danych lub zerowym PKB zaburzają wyniki analizy skupień.
+
+# Proste relacje w przekroju krajów
+
+## Udział turystyki w PKB a przeciętne bezrobocie
+
+```{r plot-share-unemployment}
+country_summary_filt %>%
+  ggplot(aes(x = tourism_share_gdp, y = mean_unemployment)) +
+  geom_point(alpha = 0.7) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Średni udział wpływów z turystyki w PKB",
+    y = "Średnie bezrobocie",
+    title = "Udział turystyki w PKB a przeciętne bezrobocie"
+  )
+```
+
+Komentarz:
+W pracy możesz tu opisać, czy kraje o bardzo wysokim udziale turystyki w PKB mają raczej niższe czy wyższe bezrobocie.
+Często kraje typowo turystyczne (np. śródziemnomorskie) mają wysoki udział turystyki, ale jednocześnie zmagają się z pewnym poziomem bezrobocia sezonowego.
+
+## Przeciętna liczba przyjazdów a poziom PKB
+
+```{r plot-arrivals-gdp}
+country_summary_filt %>%
+  ggplot(aes(x = mean_gdp, y = mean_arrivals)) +
+  geom_point(alpha = 0.7) +
+  scale_x_continuous(labels = label_number_si()) +
+  scale_y_continuous(labels = label_number_si()) +
+  labs(
+    x = "Średni poziom PKB",
+    y = "Średnia liczba przyjazdów turystów",
+    title = "Przeciętna liczba przyjazdów a PKB – przekrój krajów"
+  )
+```
+
+```{r plot-arrivals-gdp-log}
+# Ta sama relacja w skali logarytmicznej – często bardziej czytelna
+# przy dużych różnicach między krajami.
+
+country_summary_filt %>%
+  ggplot(aes(x = mean_gdp, y = mean_arrivals)) +
+  geom_point(alpha = 0.7) +
+  scale_x_log10(labels = label_number_si()) +
+  scale_y_log10(labels = label_number_si()) +
+  labs(
+    x = "Średni PKB (log10)",
+    y = "Średnia liczba przyjazdów (log10)",
+    title = "Przeciętna liczba przyjazdów a PKB (skala logarytmiczna)"
+  )
+```
+
+Komentarz:
+Skala logarytmiczna pozwala ocenić, czy zależność między PKB a liczbą przyjazdów jest zbliżona do liniowej w logach (co jest korzystne z punktu widzenia późniejszego modelowania log-log).
+
+## Przeciętne dynamiki turystyki i PKB
+
+```{r plot-growth-arrivals-gdp}
+country_summary_filt %>%
+  ggplot(aes(x = mean_growth_gdp, y = mean_growth_arrivals)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(alpha = 0.7) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Średnia roczna stopa wzrostu PKB",
+    y = "Średnia roczna stopa wzrostu liczby przyjazdów",
+    title = "Dynamika PKB a dynamika ruchu turystycznego – przekrój krajów"
+  )
+```
+
+Komentarz:
+Ten wykres pokazuje, czy kraje o szybkim wzroście gospodarczym mają też przeciętnie wysokie tempo wzrostu turystyki.
+Kolejne modele będą mogły tę zależność opisywać ilościowo, np. w postaci regresji panelowej.
+
+# Przygotowanie danych do analizy skupień
+
+W analizie skupień użyjemy zestawu cech opisujących profil kraju.
+Warto, aby zawierał zarówno poziomy (po logarytmowaniu), jak i dynamiki oraz udział turystyki w PKB.
+
+```{r cluster-data}
+cluster_data <- country_summary_filt %>%
+  transmute(
+    country,
+    country_code,
+    # Poziomy w skali log10 – zbijamy rozpiętość wartości między bardzo małymi i bardzo dużymi gospodarkami.
+    mean_arrivals_log  = log10(mean_arrivals),
+    mean_receipts_log  = log10(mean_receipts),
+    mean_gdp_log       = log10(mean_gdp),
+    # Struktura gospodarki – udział turystyki w PKB.
+    tourism_share_gdp,
+    # Przeciętne dynamiki.
+    mean_growth_arrivals,
+    mean_growth_gdp
+  ) %>%
+  # Usuwamy ewentualne obserwacje z brakami po przekształceniach.
+  drop_na()
+
+# Macierz cech do klasteryzacji (bez nazw krajów).
+cluster_vars <- cluster_data %>%
+  select(
+    mean_arrivals_log,
+    mean_receipts_log,
+    mean_gdp_log,
+    tourism_share_gdp,
+    mean_growth_arrivals,
+    mean_growth_gdp
+  )
+
+# Standaryzacja cech – każda zmienna ma średnią 0 i odchylenie standardowe 1.
+cluster_vars_scaled <- scale(cluster_vars)
+
+# Ustawiamy nazwy wierszy jako nazwy krajów – przyda się w wizualizacjach.
+rownames(cluster_vars_scaled) <- cluster_data$country
+
+dim(cluster_vars_scaled)
+```
+
+Komentarz:
+Standaryzacja jest kluczowa – bez niej zmienne o dużej skali (np. PKB) zdominowałyby wynik analizy skupień kosztem zmiennych procentowych (udział turystyki, stopy wzrostu).
+
+# Wybór liczby klastrów
+
+```{r choose-k, fig.height=4}
+set.seed(123)
+
+# Wykres "łokcia" – suma kwadratów wewnątrz klastrów (WSS) dla różnych wartości k.
+fviz_nbclust(cluster_vars_scaled, kmeans, method = "wss") +
+  labs(
+    title = "Wybór liczby klastrów – metoda łokcia"
+  )
+```
+
+```{r choose-k-silhouette, fig.height=4}
+set.seed(123)
+
+# Wykres średniego współczynnika sylwetki dla różnych k.
+fviz_nbclust(cluster_vars_scaled, kmeans, method = "silhouette") +
+  labs(
+    title = "Wybór liczby klastrów – metoda sylwetki"
+  )
+```
+
+Komentarz:
+Na podstawie tych dwóch wykresów możesz w pracy uzasadnić wybór konkretnej liczby klastrów (np. 3 lub 4), opisując, przy jakim k poprawa dopasowania zaczyna być niewielka (łokieć) oraz dla jakiej wartości k średnia sylwetka jest najwyższa.
+
+# Analiza skupień krajów (k-średnich)
+
+Dla przykładu przyjmijmy 3 klastry.
+Jeżeli na wykresach z poprzedniego kroku widać, że bardziej uzasadnione jest k = 4, wystarczy zmienić wartość zmiennej `k`.
+
+```{r kmeans}
+set.seed(123)
+
+k <- 3  # w razie potrzeby można zmienić np. na 4
+
+km_res <- kmeans(
+  x       = cluster_vars_scaled,
+  centers = k,
+  nstart  = 30
+)
+
+# Rozmiary klastrów
+km_res$size
+```
+
+```{r attach-clusters}
+# Dołączamy numer klastra do tabeli z cechami krajów.
+country_clusters <- cluster_data %>%
+  mutate(
+    cluster = factor(km_res$cluster)
+  )
+
+# Podgląd kilku krajów w każdej grupie.
+country_clusters %>%
+  arrange(cluster, desc(mean_arrivals_log)) %>%
+  group_by(cluster) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+```
+
+Komentarz:
+Na tej podstawie możesz w pracy nazwać grupy (np. „klaster 1 – duże gospodarki o wysokim ruchu turystycznym”, „klaster 2 – kraje o średnim PKB, ale wysokim udziale turystyki” itd.).
+
+## Wizualizacja klastrów w przestrzeni cech
+
+```{r plot-clusters, fig.height=5}
+fviz_cluster(
+  object = km_res,
+  data   = cluster_vars_scaled,
+  geom   = "point",
+  ellipse.type = "norm",
+  ggtheme = theme_minimal()
+) +
+  labs(
+    title = "Grupy krajów na podstawie profilu turystyczno-ekonomicznego"
+  )
+```
+
+Komentarz:
+Wizualizacja z `fviz_cluster` pokazuje, jak klastry są rozdzielone w przestrzeni wielowymiarowej (po zredukowaniu do dwóch głównych składowych).
+Nie interpretujemy osi bezpośrednio – istotne jest to, że kraje z tego samego klastra leżą blisko siebie.
+
+## Profile klastrów – porównanie przeciętnych wartości zmiennych
+
+```{r cluster-profiles}
+cluster_profile <- country_clusters %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_arrivals_log   = mean(mean_arrivals_log,   na.rm = TRUE),
+    mean_receipts_log   = mean(mean_receipts_log,   na.rm = TRUE),
+    mean_gdp_log        = mean(mean_gdp_log,        na.rm = TRUE),
+    tourism_share_gdp   = mean(tourism_share_gdp,   na.rm = TRUE),
+    mean_growth_arrivals= mean(mean_growth_arrivals,na.rm = TRUE),
+    mean_growth_gdp     = mean(mean_growth_gdp,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = -cluster,
+    names_to = "measure",
+    values_to = "value"
+  )
+
+cluster_profile
+```
+
+```{r plot-cluster-profiles}
+cluster_profile %>%
+  ggplot(aes(x = measure, y = value, fill = cluster)) +
+  geom_col(position = "dodge") +
+  scale_x_discrete(
+    labels = c(
+      mean_arrivals_log    = "log10(średnich przyjazdów)",
+      mean_receipts_log    = "log10(średnich wpływów)",
+      mean_gdp_log         = "log10(średniego PKB)",
+      tourism_share_gdp    = "udział turystyki w PKB",
+      mean_growth_arrivals = "średnia stopa wzrostu przyjazdów",
+      mean_growth_gdp      = "średnia stopa wzrostu PKB"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Wartość przeciętna (logi lub udział/stopa)",
+    fill = "Klaster",
+    title = "Profil klastrów – porównanie przeciętnych wartości zmiennych"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+```
+
+Komentarz:
+Ten wykres pozwala zilustrować, czym różnią się klastry.
+Na przykład możesz zauważyć, że:
+
+- jeden klaster ma wysokie logarytmy przyjazdów i wpływów oraz wysoki PKB – są to „duże, bogate kraje turystyczne”,
+- inny klaster ma niższy PKB, ale stosunkowo wysoki udział turystyki w PKB – kraje silnie uzależnione od turystyki,
+- kolejny klaster może charakteryzować się wyższymi średnimi stopami wzrostu – kraje doganiające, w których turystyka dynamicznie się rozwija.
+
+# Podsumowanie
+
+W tym notebooku:
+- zbudowano zestaw cech opisujących profil turystyczno-ekonomiczny krajów (poziomy, dynamiki, struktura udziału turystyki w PKB),
+- przeanalizowano proste relacje w przekroju krajów (np. udział turystyki vs bezrobocie, liczba przyjazdów vs PKB),
+- przeprowadzono analizę skupień metodą k-średnich, co pozwoliło podzielić kraje na kilka grup o podobnych cechach,
+- przedstawiono wizualizacje klastrów oraz ich profili, które można wykorzystać przy interpretacji wyników i projektowaniu dalszych modeli.
+
+W kolejnych rozdziałach pracy możesz odwoływać się do tych grup, porównując np. parametry modeli dla poszczególnych klastrów lub opisując, w jakich typach gospodarek wpływ wskaźników makroekonomicznych na ruch turystyczny jest najsilniejszy.

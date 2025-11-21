@@ -1,0 +1,387 @@
+---
+title: "Eksploracyjna analiza danych – relacje i grupy krajów"
+author: "Łucja Wuls"
+date: "2025-11-07"
+---
+
+# Wstęp
+
+Celem tego notebooka jest eksploracja zależności pomiędzy zmiennymi turystycznymi a wskaźnikami makroekonomicznymi oraz analiza porównawcza dla wybranych grup krajów.
+Pracujemy na wyczyszczonym zbiorze `world_tourism_economy_data_clean.csv`, przygotowanym we wcześniejszym etapie.
+
+W tej części:
+- analizujemy relacje w poziomach (np. logarytm liczby przyjazdów vs logarytm PKB),
+- analizujemy relacje w dynamikach (korelacje stóp wzrostu),
+- definiujemy grupy krajów na podstawie średniego poziomu PKB i porównujemy profile turystyczne tych grup.
+
+# Przygotowanie środowiska
+
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+# Pakiety potrzebne w tej części EDA.
+# tidyverse – dplyr, tidyr, ggplot2 itd. do pracy z danymi i wykresami.
+
+library(tidyverse)
+```
+
+# Wczytanie danych
+
+```{r}
+# Ścieżka do wyczyszczonego zbioru.
+clean_path <- "data/clean/world_tourism_economy_data_clean.csv"
+
+# Wczytanie danych.
+tourism <- readr::read_csv(clean_path, show_col_types = FALSE)
+
+# Kontrolny podgląd danych.
+glimpse(tourism)
+```
+
+# Przygotowanie zmiennych pochodnych
+
+```{r}
+# Definiujemy zmienne ilościowe wykorzystywane w analizie relacji.
+measure_vars <- c(
+  "tourism_receipts",
+  "tourism_arrivals",
+  "tourism_exports",
+  "tourism_departures",
+  "tourism_expenditures",
+  "gdp",
+  "inflation",
+  "unemployment"
+)
+
+# Tworzymy zmienne pochodne:
+# - logarytmy (log1p, aby bezpiecznie traktować obserwacje równe 0),
+# - udział wpływów z turystyki w PKB.
+
+tourism <- tourism %>%
+  mutate(
+    log_tourism_arrivals   = log1p(tourism_arrivals),
+    log_tourism_receipts   = log1p(tourism_receipts),
+    log_gdp                = log1p(gdp),
+    tourism_receipts_share = tourism_receipts / gdp
+  )
+
+# Zakres lat w danych – przyda się przy wyborze roku referencyjnego.
+range(tourism$year, na.rm = TRUE)
+```
+
+# Relacje w poziomach – przekrój krajów
+
+## Wybór roku referencyjnego
+
+```{r}
+# Wybieramy rok referencyjny do analizy przekrojowej.
+
+year_ref <- 2019
+
+tourism_ref <- tourism %>%
+  filter(year == year_ref)
+
+nrow(tourism_ref)
+```
+
+## Zależność liczby przyjazdów od wielkości gospodarki
+
+```{r}
+# Wykres rozrzutu log(liczby przyjazdów) vs log(PKB). Interpretacja: czy większe gospodarki przyciągają więcej turystów?
+
+tourism_ref %>%
+  ggplot(aes(x = log_gdp, y = log_tourism_arrivals)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    x = "log(PKB) [log USD]",
+    y = "log(liczby przyjazdów turystów)",
+    title = paste0("Zależność liczby przyjazdów od PKB – rok ", year_ref)
+  )
+```
+
+```{r}
+# Współczynnik korelacji pomiędzy log(PKB) i log(liczby przyjazdów).
+tourism_ref %>%
+  summarise(
+    cor_log_arrivals_log_gdp = cor(log_tourism_arrivals, log_gdp, use = "complete.obs")
+  )
+```
+
+## Zależność znaczenia turystyki od bezrobocia
+
+```{r}
+# Wykres rozrzutu: udział wpływów z turystyki w PKB vs stopa bezrobocia. Pozwala wstępnie sprawdzić, czy kraje silnie zależne od turystyki charakteryzują się inną stopą bezrobocia.
+
+tourism_ref %>%
+  ggplot(aes(x = unemployment, y = tourism_receipts_share)) +
+  geom_point(alpha = 0.6) +
+  labs(
+    x = "Stopa bezrobocia [%]",
+    y = "Udział wpływów z turystyki w PKB",
+    title = paste0("Turystyka a bezrobocie – rok ", year_ref)
+  )
+```
+
+```{r}
+# Współczynnik korelacji pomiędzy udziałem turystyki w PKB a stopą bezrobocia.
+tourism_ref %>%
+  summarise(
+    cor_share_unemployment = cor(tourism_receipts_share, unemployment, use = "complete.obs")
+  )
+```
+
+## Zależność wpływów z turystyki od inflacji
+
+```{r}
+# Wykres rozrzutu: log(wpływów z turystyki) vs inflacja. Celem jest ocena, czy kraje o wysokiej inflacji są mniej atrakcyjne turystycznie.
+
+tourism_ref %>%
+  ggplot(aes(x = inflation, y = log_tourism_receipts)) +
+  geom_point(alpha = 0.6) +
+  labs(
+    x = "Inflacja [%]",
+    y = "log(wpływów z turystyki) [log USD]",
+    title = paste0("Wpływy z turystyki a inflacja – rok ", year_ref)
+  )
+```
+
+```{r}
+# Współczynnik korelacji pomiędzy log(wpływów z turystyki) a inflacją.
+tourism_ref %>%
+  summarise(
+    cor_log_receipts_inflation = cor(log_tourism_receipts, inflation, use = "complete.obs")
+  )
+```
+
+
+# Relacje w dynamikach – stopy wzrostu
+
+## Wyznaczenie stóp wzrostu
+
+```{r}
+# Tworzymy zmienne dynamiki (stopy wzrostu r/r) w obrębie krajów.
+# Definicja: growth_x_it = (x_it - x_i,t-1) / x_i,t-1
+# Pierwszego roku dla danego kraju dynamika jest NA.
+
+tourism_panel <- tourism %>%
+  arrange(country, country_code, year) %>%
+  group_by(country, country_code) %>%
+  mutate(
+    growth_arrivals = (tourism_arrivals - lag(tourism_arrivals)) / lag(tourism_arrivals),
+    growth_receipts = (tourism_receipts - lag(tourism_receipts)) / lag(tourism_receipts),
+    growth_gdp      = (gdp - lag(gdp)) / lag(gdp)
+  ) %>%
+  ungroup()
+
+# Podgląd nowych zmiennych.
+tourism_panel %>%
+  select(country, year, growth_arrivals, growth_receipts, growth_gdp) %>%
+  head()
+```
+
+## Macierz korelacji dla dynamik
+
+```{r}
+# Wybieramy podzbiór zmiennych dynamiki i zmiennych makro.
+growth_data <- tourism_panel %>%
+  select(
+    growth_arrivals,
+    growth_receipts,
+    growth_gdp,
+    inflation,
+    unemployment
+  )
+
+# Usuwamy wiersze, gdzie wszystkie są NA (np. pierwszy rok dla danego kraju).
+growth_data <- growth_data %>%
+  filter(if_any(everything(), ~ !is.na(.)))
+
+# Macierz korelacji.
+corr_growth <- cor(growth_data, use = "pairwise.complete.obs")
+corr_growth
+```
+
+```{r}
+# Prosta heatmapa macierzy korelacji dla dynamik i zmiennych makro.
+
+corr_df <- as.data.frame(as.table(corr_growth))
+names(corr_df) <- c("var_x", "var_y", "correlation")
+
+ggplot(corr_df, aes(x = var_x, y = var_y, fill = correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    limits = c(-1, 1),
+    midpoint = 0,
+    name = "Korelacja"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Macierz korelacji: dynamiki turystyki i zmienne makro"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Zależności dynamik: przykładowe wykresy rozrzutu
+
+```{r}
+# Wykres rozrzutu growth_arrivals vs growth_gdp. Sprawdzamy, czy szybszy wzrost PKB wiąże się ze wzrostem przyjazdów.
+
+tourism_panel %>%
+  ggplot(aes(x = growth_gdp, y = growth_arrivals)) +
+  geom_point(alpha = 0.4) +
+  labs(
+    x = "Stopa wzrostu PKB",
+    y = "Stopa wzrostu liczby przyjazdów",
+    title = "Dynamika liczby przyjazdów a dynamika PKB"
+  )
+```
+
+```{r}
+# Wykres rozrzutu growth_arrivals vs inflation. Sprawdzamy, czy wyższa inflacja wiąże się z niższym tempem wzrostu ruchu turystycznego.
+
+tourism_panel %>%
+  ggplot(aes(x = inflation, y = growth_arrivals)) +
+  geom_point(alpha = 0.4) +
+  labs(
+    x = "Inflacja [%]",
+    y = "Stopa wzrostu liczby przyjazdów",
+    title = "Dynamika liczby przyjazdów a inflacja"
+  )
+```
+
+
+# Definiowanie grup krajów na podstawie średniego poziomu PKB
+
+W celu realizacji części „analiza porównawcza dla grupy krajów” potrzebujemy podziału na grupy.
+Ponieważ zbiór nie zawiera gotowej klasyfikacji (np. grup dochodowych Banku Światowego), w tej części definiujemy grupy w sposób danych-pochodny – na podstawie średniego PKB w wybranym okresie.
+
+```{r}
+# Okres referencyjny do wyznaczenia grup (np. 2015–2019).
+window_ref <- 2015:2019
+
+country_stats <- tourism_panel %>%
+  filter(year %in% window_ref) %>%
+  group_by(country, country_code) %>%
+  summarise(
+    mean_gdp              = mean(gdp, na.rm = TRUE),
+    mean_receipts_share   = mean(tourism_receipts_share, na.rm = TRUE),
+    mean_growth_arrivals  = mean(growth_arrivals, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Usuwamy kraje, dla których nie udało się policzyć średniego PKB (np. zbyt mało danych).
+  filter(!is.na(mean_gdp))
+
+# Podgląd statystyk.
+head(country_stats)
+```
+
+```{r}
+# Tworzymy trzy grupy krajów na podstawie tercyla średniego PKB:
+# - "low_gdp" – kraje o relatywnie niskim PKB,
+# - "mid_gdp" – kraje o średnim PKB,
+# - "high_gdp" – kraje o najwyższym PKB.
+
+country_stats <- country_stats %>%
+  mutate(
+    gdp_group = ntile(mean_gdp, 3),
+    gdp_group = case_when(
+      gdp_group == 1 ~ "low_gdp",
+      gdp_group == 2 ~ "mid_gdp",
+      gdp_group == 3 ~ "high_gdp"
+    )
+  )
+
+country_stats %>%
+  count(gdp_group)
+```
+
+```{r}
+# Dołączamy informację o grupie PKB z powrotem do danych panelowych.
+tourism_panel <- tourism_panel %>%
+  left_join(
+    country_stats %>%
+      select(country, country_code, gdp_group),
+    by = c("country", "country_code")
+  )
+
+# Kontrola: podgląd danych z grupą.
+tourism_panel %>%
+  select(country, year, gdp_group, tourism_arrivals, tourism_receipts_share) %>%
+  head()
+```
+
+# Analiza porównawcza między grupami krajów
+
+## Udział turystyki w PKB w podziale na grupy krajów
+
+```{r}
+# Boxplot udziału turystyki w PKB dla krajów z różnych grup PKB. Analiza na poziomie wszystkich lat w oknie referencyjnym.
+
+tourism_panel %>%
+  filter(year %in% window_ref) %>%
+  ggplot(aes(x = gdp_group, y = tourism_receipts_share)) +
+  geom_boxplot() +
+  labs(
+    x = "Grupa krajów wg średniego PKB",
+    y = "Udział wpływów z turystyki w PKB",
+    title = "Udział turystyki w gospodarce a poziom PKB"
+  )
+```
+
+## Dynamika liczby przyjazdów w podziale na grupy krajów
+
+```{r}
+# Boxplot stóp wzrostu liczby przyjazdów dla poszczególnych grup krajów.
+
+tourism_panel %>%
+  filter(year %in% window_ref) %>%
+  ggplot(aes(x = gdp_group, y = growth_arrivals)) +
+  geom_boxplot() +
+  labs(
+    x = "Grupa krajów wg średniego PKB",
+    y = "Stopa wzrostu liczby przyjazdów",
+    title = "Dynamika ruchu turystycznego a poziom PKB"
+  )
+```
+
+## Średnie profile czasowe dla grup krajów
+
+```{r}
+# Wyznaczamy średnią liczbę przyjazdów w czasie dla każdej grupy krajów.
+
+group_profiles <- tourism_panel %>%
+  filter(!is.na(gdp_group)) %>%
+  group_by(gdp_group, year) %>%
+  summarise(
+    mean_arrivals = mean(tourism_arrivals, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+group_profiles %>%
+  ggplot(aes(x = year, y = mean_arrivals, color = gdp_group)) +
+  geom_line() +
+  labs(
+    x = "Rok",
+    y = "Średnia liczba przyjazdów",
+    color = "Grupa PKB",
+    title = "Średnia liczba przyjazdów w czasie w podziale na grupy krajów"
+  )
+```
+
+
+# Podsumowanie
+
+W tym notebooku:
+- przeanalizowano relacje pomiędzy wybranymi zmiennymi turystycznymi i makroekonomicznymi w przekroju krajów,
+- zbadano korelacje między dynamikami ruchu turystycznego a zmianami PKB, inflacji i bezrobocia,
+- zdefiniowano grupy krajów na podstawie średniego poziomu PKB i porównano ich charakterystykę turystyczną.
+
+Uzyskane wyniki stanowią punkt wyjścia do dalszego modelowania wpływu wskaźników makroekonomicznych na dynamikę międzynarodowego ruchu turystycznego w kolejnych rozdziałach pracy.
