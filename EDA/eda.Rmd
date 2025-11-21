@@ -1,0 +1,244 @@
+---
+title: "Eksploracyjna analiza danych – klasyczna"
+output: "Łucja Wuls"
+date: "2025-11-21"
+---
+
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(readr)
+library(skimr)
+library(tibble)
+```
+
+# Wprowadzenie
+
+Celem niniejszego rozdziału jest przeprowadzenie klasycznej eksploracyjnej analizy danych (EDA) skoncentrowanej na samych zmiennych opisujących międzynarodowy ruch turystyczny oraz wybrane wskaźniki makroekonomiczne. Zagadnienia związane ze strukturą zbioru, brakami danych i procedurami czyszczenia zostały szczegółowo omówione w osobnym rozdziale. W dalszej części skupiamy się na skalach wartości, rozkładach, prostych transformacjach oraz podstawowych zależnościach pomiędzy zmiennymi.
+
+# Struktura zbioru danych – zarys
+
+## Wczytanie danych i podstawowe informacje
+
+```{r}
+tourism <- read_csv("../data/clean/world_tourism_economy_data_clean.csv")
+
+glimpse(tourism)
+```
+
+```{r}
+tourism %>%
+  summarise(
+    n_rows      = n(),
+    n_countries = n_distinct(country),
+    year_min    = min(year, na.rm = TRUE),
+    year_max    = max(year, na.rm = TRUE)
+  )
+```
+
+## Ogólna charakterystyka zmiennych
+
+```{r}
+skim(tourism)
+```
+
+Powyższe zestawienia służą jako punkt wyjścia do dalszej, bardziej szczegółowej analizy zmiennych.
+
+# Statystyki opisowe głównych wskaźników
+
+## Wybór zmiennych i zbiorcze statystyki
+
+```{r}
+vars_to_describe <- c(
+  "tourism_arrivals",
+  "tourism_receipts",
+  "tourism_expenditures",
+  "tourism_exports",
+  "tourism_departures",
+  "gdp",
+  "inflation",
+  "unemployment"
+)
+
+numeric_subset <- tourism %>%
+  select(any_of(vars_to_describe))
+```
+
+```{r}
+descriptives <- numeric_subset %>%
+  summarise(across(
+    everything(),
+    list(
+      n      = ~ sum(!is.na(.)),
+      mean   = ~ mean(., na.rm = TRUE),
+      sd     = ~ sd(., na.rm = TRUE),
+      p25    = ~ quantile(., 0.25, na.rm = TRUE),
+      median = ~ median(., na.rm = TRUE),
+      p75    = ~ quantile(., 0.75, na.rm = TRUE),
+      min    = ~ min(., na.rm = TRUE),
+      max    = ~ max(., na.rm = TRUE)
+    ),
+    .names = "{.col}_{.fn}"
+  ))
+
+descriptives
+```
+
+Uzyskane statystyki opisowe mogą zostać następnie przedstawione w pracy jako tabela zbiorcza dla głównych wskaźników turystycznych i makroekonomicznych.
+
+# Rozkłady zmiennych
+
+## Przygotowanie danych w układzie długim
+
+```{r}
+vars_to_plot <- vars_to_describe
+
+tourism_long <- tourism %>%
+  pivot_longer(
+    cols = all_of(vars_to_plot),
+    names_to = "variable",
+    values_to = "value"
+  )
+```
+
+## Histogramy wartości surowych
+
+```{r}
+ggplot(tourism_long, aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(
+    x = "Wartość",
+    y = "Liczba obserwacji",
+    title = "Rozkłady podstawowych wskaźników (wartości surowe)"
+  )
+```
+
+Histogramy surowych wartości pozwalają ocenić m.in. skalę skośności rozkładów i obecność krajów o ekstremalnie wysokich wartościach wskaźników.
+
+## Histogramy po transformacji logarytmicznej
+
+```{r}
+tourism_long_log <- tourism_long %>%
+  filter(value > 0) %>%
+  mutate(log10_value = log10(value))
+
+ggplot(tourism_long_log, aes(x = log10_value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(
+    x = "log10(wartość)",
+    y = "Liczba obserwacji",
+    title = "Rozkłady podstawowych wskaźników po transformacji logarytmicznej"
+  )
+```
+
+Transformacja logarytmiczna umożliwia porównywanie zmiennych różniących się rzędami wielkości i zmniejsza wpływ obserwacji skrajnych na kształt rozkładów.
+
+# Zależności między wskaźnikami
+
+## Macierz korelacji
+
+```{r}
+cor_data <- tourism %>%
+  select(any_of(vars_to_describe))
+
+cor_mat <- cor(cor_data, use = "pairwise.complete.obs")
+
+cor_mat
+```
+
+## Wizualizacja macierzy korelacji
+
+```{r}
+cor_long <- cor_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(
+    cols = -var1,
+    names_to = "var2",
+    values_to = "cor"
+  )
+
+ggplot(cor_long, aes(x = var1, y = var2, fill = cor)) +
+  geom_tile() +
+  scale_fill_gradient2(limits = c(-1, 1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Korelacja",
+    title = "Macierz korelacji wybranych wskaźników"
+  )
+```
+
+Heatmapa  macierzy korelacji pozwala szybko wskazać pary zmiennych o najsilniejszych powiązaniach dodatnich i ujemnych.
+
+## Wykres rozrzutu: logarytm PKB a logarytm liczby przyjazdów
+
+```{r}
+scatter_data <- tourism %>%
+  select(country, year, gdp, tourism_arrivals) %>%
+  filter(!is.na(gdp), !is.na(tourism_arrivals),
+         gdp > 0, tourism_arrivals > 0) %>%
+  mutate(
+    log10_gdp      = log10(gdp),
+    log10_arrivals = log10(tourism_arrivals)
+  )
+
+ggplot(scatter_data, aes(x = log10_gdp, y = log10_arrivals)) +
+  geom_point(alpha = 0.4) +
+  labs(
+    x = "log10(PKB)",
+    y = "log10(liczby przyjazdów)",
+    title = "Zależność między wielkością gospodarki a skalą ruchu turystycznego"
+  )
+```
+
+Taki wykres rozrzutu ilustruje powiązanie pomiędzy wielkością gospodarki a poziomem międzynarodowego ruchu turystycznego.
+
+# Średnie wartości wskaźników w czasie
+
+## Obliczenie średnich rocznych
+
+```{r}
+avg_by_year <- tourism %>%
+  group_by(year) %>%
+  summarise(
+    arrivals_mean   = mean(tourism_arrivals, na.rm = TRUE),
+    receipts_mean   = mean(tourism_receipts, na.rm = TRUE),
+    gdp_mean        = mean(gdp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+avg_by_year_long <- avg_by_year %>%
+  pivot_longer(
+    cols = -year,
+    names_to = "variable",
+    values_to = "value"
+  )
+```
+
+## Wykres średnich rocznych wartości wskaźników
+
+```{r}
+ggplot(avg_by_year_long, aes(x = year, y = value)) +
+  geom_line() +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    x = "Rok",
+    y = "Średnia wartość",
+    title = "Średnie roczne wartości wybranych wskaźników"
+  )
+```
+
+Wykres średnich rocznych wartości wskaźników stanowi punkt wyjścia do dalszej analizy dynamiki w czasie, w tym do oceny wpływu kryzysów gospodarczych i zdrowotnych na międzynarodowy ruch turystyczny.
+
+# Podsumowanie
+
+W niniejszym rozdziale skoncentrowano się na opisowej charakterystyce zmiennych: przedstawiono zbiorcze statystyki opisowe, rozkłady surowych wartości i ich logarytmów, podstawowe zależności korelacyjne oraz średnie roczne wartości wybranych wskaźników. Uzyskane wyniki tworzą tło dla bardziej zaawansowanych analiz porównawczych oraz modelowania wpływu wskaźników makroekonomicznych na dynamikę międzynarodowego ruchu turystycznego.

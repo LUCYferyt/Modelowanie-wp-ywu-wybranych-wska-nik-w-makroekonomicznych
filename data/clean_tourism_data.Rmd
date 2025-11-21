@@ -34,7 +34,7 @@ library(zoo)
 
 ```{r}
 # Ścieżka do pliku surowego.
-raw_path <- "data/raw/world_tourism_economy_data.csv"
+raw_path <- "raw/world_tourism_economy_data.csv"
 
 # Wczytanie danych csv.
 # show_col_types = FALSE, aby nie zaśmiecać konsoli komunikatami o typach.
@@ -236,7 +236,7 @@ summary(
 
 ```{r}
 # Definiujemy ścieżkę do pliku wyjściowego.
-clean_path <- "data/clean/world_tourism_economy_data_clean.csv"
+clean_path <- "clean/world_tourism_economy_data_clean.csv"
 
 # Na wszelki wypadek tworzymy katalog output, jeśli nie istnieje.
 dir.create(dirname(clean_path), recursive = TRUE, showWarnings = FALSE)

@@ -9,7 +9,7 @@ library(tidyverse)
 library(janitor)
 library(skimr)
 
-df <- read_csv("data/raw/world_tourism_economy_data.csv") |>
+df <- read_csv("raw/world_tourism_economy_data.csv") |>
   clean_names()
 
 glimpse(df)

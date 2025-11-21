@@ -1,0 +1,397 @@
+---
+title: "Eksploracyjna analiza danych – rozszerzona"
+output: "Łucja Wuls"
+date: "2025-11-21"
+---
+
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(readr)
+library(skimr)
+library(tibble)
+```
+
+# Rozszerzona analiza porównawcza
+
+W niniejszym rozdziale rozszerzono klasyczną analizę opisową o elementy porównawcze i dynamiczne. Celem jest zbadanie, jak zmieniały się kluczowe wskaźniki turystyczne w czasie, w jaki sposób zachowują się różne grupy krajów oraz jak silny był wpływ pandemii COVID-19 na międzynarodowy ruch turystyczny.
+
+## Wczytanie danych
+
+```{r}
+tourism <- read_csv("../data/clean/world_tourism_economy_data_clean.csv")
+
+glimpse(tourism)
+```
+
+## Przygotowanie podstawowego zestawu zmiennych
+
+```{r}
+vars_core <- c(
+  "tourism_arrivals",
+  "tourism_receipts",
+  "tourism_expenditures",
+  "tourism_exports",
+  "tourism_departures",
+  "gdp",
+  "inflation",
+  "unemployment"
+)
+
+tourism_core <- tourism %>%
+  select(country, country_code, year, all_of(vars_core))
+```
+
+# Dynamika ruchu turystycznego (przyrosty rok do roku)
+
+W pierwszym kroku analizujemy dynamikę rok do roku dla wybranych wskaźników turystycznych i makroekonomicznych. Interesują nas zarówno zmiany absolutne, jak i procentowe.
+
+## Obliczenie przyrostów rok do roku
+
+```{r}
+tourism_yoy <- tourism_core %>%
+  group_by(country) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    arrivals_yoy_abs = tourism_arrivals - lag(tourism_arrivals),
+    receipts_yoy_abs = tourism_receipts - lag(tourism_receipts),
+    gdp_yoy_abs      = gdp - lag(gdp),
+    arrivals_yoy_pct = if_else(
+      lag(tourism_arrivals) > 0,
+      100 * (tourism_arrivals - lag(tourism_arrivals)) / lag(tourism_arrivals),
+      NA_real_
+    ),
+    receipts_yoy_pct = if_else(
+      lag(tourism_receipts) > 0,
+      100 * (tourism_receipts - lag(tourism_receipts)) / lag(tourism_receipts),
+      NA_real_
+    ),
+    gdp_yoy_pct = if_else(
+      lag(gdp) > 0,
+      100 * (gdp - lag(gdp)) / lag(gdp),
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+tourism_yoy %>%
+  select(country, year,
+         arrivals_yoy_abs, arrivals_yoy_pct,
+         receipts_yoy_abs, receipts_yoy_pct,
+         gdp_yoy_abs, gdp_yoy_pct) %>%
+  head()
+```
+
+## Rozkład przyrostów procentowych w czasie
+
+```{r}
+yoy_summary <- tourism_yoy %>%
+  group_by(year) %>%
+  summarise(
+    arrivals_yoy_median = median(arrivals_yoy_pct, na.rm = TRUE),
+    arrivals_yoy_p25    = quantile(arrivals_yoy_pct, 0.25, na.rm = TRUE),
+    arrivals_yoy_p75    = quantile(arrivals_yoy_pct, 0.75, na.rm = TRUE),
+    receipts_yoy_median = median(receipts_yoy_pct, na.rm = TRUE),
+    receipts_yoy_p25    = quantile(receipts_yoy_pct, 0.25, na.rm = TRUE),
+    receipts_yoy_p75    = quantile(receipts_yoy_pct, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+yoy_summary
+```
+
+```{r}
+tourism_yoy %>%
+  filter(!is.na(arrivals_yoy_pct)) %>%
+  ggplot(aes(x = factor(year), y = arrivals_yoy_pct)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  coord_cartesian(ylim = c(-100, 200)) +
+  labs(
+    x = "Rok",
+    y = "Przyrost liczby przyjazdów rok do roku [%]",
+    title = "Rozkład przyrostów liczby przyjazdów między krajami"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+```
+
+```{r}
+yoy_summary_long <- yoy_summary %>%
+  select(year,
+         arrivals_yoy_median, receipts_yoy_median) %>%
+  pivot_longer(
+    cols = -year,
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(yoy_summary_long, aes(x = year, y = value, colour = variable)) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Rok",
+    y = "Mediana przyrostów rok do roku [%]",
+    colour = NULL,
+    title = "Mediana przyrostów rok do roku dla liczby przyjazdów i przychodów z turystyki"
+  )
+```
+
+# Porównanie grup krajów według zależności od turystyki
+
+W tej części konstruujemy proste grupy krajów w zależności od znaczenia turystyki w gospodarce. Jako miarę zależności od turystyki wykorzystamy średni udział przychodów z turystyki w PKB w okresie bezpośrednio poprzedzającym pandemię (2015–2019).
+
+## Definicja grup zależności od turystyki
+
+```{r}
+tourism_dep_index <- tourism_core %>%
+  filter(year >= 2015, year <= 2019) %>%
+  mutate(
+    receipts_to_gdp = tourism_receipts / gdp
+  ) %>%
+  group_by(country, country_code) %>%
+  summarise(
+    mean_receipts_to_gdp = mean(receipts_to_gdp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(mean_receipts_to_gdp))
+
+quantiles <- quantile(tourism_dep_index$mean_receipts_to_gdp,
+                      probs = c(1/3, 2/3), na.rm = TRUE)
+
+quantiles
+```
+
+```{r}
+tourism_dep_index <- tourism_dep_index %>%
+  mutate(
+    dep_group = case_when(
+      mean_receipts_to_gdp < quantiles[1] ~ "niska zależność",
+      mean_receipts_to_gdp < quantiles[2] ~ "średnia zależność",
+      TRUE                               ~ "wysoka zależność"
+    )
+  )
+
+tourism_dep_index %>%
+  count(dep_group)
+```
+
+```{r}
+tourism_grouped <- tourism_core %>%
+  left_join(tourism_dep_index %>% select(country, dep_group),
+            by = "country")
+```
+
+## Średnie wskaźniki w grupach krajów
+
+```{r}
+group_avg_by_year <- tourism_grouped %>%
+  filter(!is.na(dep_group)) %>%
+  group_by(dep_group, year) %>%
+  summarise(
+    arrivals_mean = mean(tourism_arrivals, na.rm = TRUE),
+    receipts_mean = mean(tourism_receipts, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+group_avg_by_year_long <- group_avg_by_year %>%
+  pivot_longer(
+    cols = c(arrivals_mean, receipts_mean),
+    names_to = "variable",
+    values_to = "value"
+  )
+```
+
+```{r}
+ggplot(group_avg_by_year_long,
+       aes(x = year, y = value, colour = dep_group)) +
+  geom_line() +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    x = "Rok",
+    y = "Średnia wartość",
+    colour = "Grupa krajów",
+    title = "Średnie wartości wskaźników turystycznych
+w grupach krajów o różnej zależności od turystyki"
+  )
+```
+
+## Porównanie poziomów przed pandemią
+
+```{r}
+group_2019 <- tourism_grouped %>%
+  filter(year == 2019, !is.na(dep_group)) %>%
+  select(country, dep_group, tourism_arrivals, tourism_receipts)
+
+ggplot(group_2019, aes(x = dep_group, y = tourism_arrivals)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  labs(
+    x = "Grupa krajów",
+    y = "Liczba przyjazdów (skala log10)",
+    title = "Rozkład liczby przyjazdów w 2019 r. w grupach krajów"
+  )
+
+ggplot(group_2019, aes(x = dep_group, y = tourism_receipts)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  labs(
+    x = "Grupa krajów",
+    y = "Przychody z turystyki (skala log10)",
+    title = "Rozkład przychodów z turystyki w 2019 r. w grupach krajów"
+  )
+```
+
+# Wpływ pandemii COVID-19 na ruch turystyczny
+
+W tej części analizujemy wpływ pandemii COVID-19 na międzynarodowy ruch turystyczny, zarówno z perspektywy globalnej, jak i w podziale na grupy krajów o różnej zależności od turystyki.
+
+## Średnie globalne wskaźniki 2019–2020
+
+```{r}
+covid_global <- tourism_core %>%
+  filter(year %in% c(2019, 2020)) %>%
+  group_by(year) %>%
+  summarise(
+    arrivals_mean  = mean(tourism_arrivals,  na.rm = TRUE),
+    receipts_mean  = mean(tourism_receipts,  na.rm = TRUE),
+    gdp_mean       = mean(gdp,              na.rm = TRUE),
+    .groups = "drop"
+  )
+
+covid_global
+```
+
+## Spadki liczby przyjazdów 2019–2020 według krajów
+
+```{r}
+covid_drop_arrivals <- tourism_core %>%
+  filter(year %in% c(2019, 2020)) %>%
+  select(country, year, tourism_arrivals) %>%
+  pivot_wider(
+    names_from = year,
+    values_from = tourism_arrivals,
+    names_prefix = "arrivals_"
+  ) %>%
+  filter(!is.na(arrivals_2019), !is.na(arrivals_2020),
+         arrivals_2019 > 0) %>%
+  mutate(
+    drop_abs = arrivals_2020 - arrivals_2019,
+    drop_pct = 100 * (arrivals_2020 - arrivals_2019) / arrivals_2019
+  )
+
+covid_drop_arrivals_top <- covid_drop_arrivals %>%
+  arrange(drop_pct) %>%
+  slice_head(n = 20)
+
+covid_drop_arrivals_top
+```
+
+```{r}
+ggplot(covid_drop_arrivals_top,
+       aes(x = reorder(country, drop_pct), y = drop_pct)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Kraj",
+    y = "Spadek liczby przyjazdów 2020 vs 2019 [%]",
+    title = "Największe procentowe spadki liczby przyjazdów turystów w 2020 roku"
+  )
+```
+
+## Spadki przychodów z turystyki 2019–2020 według krajów
+
+```{r}
+covid_drop_receipts <- tourism_core %>%
+  filter(year %in% c(2019, 2020)) %>%
+  select(country, year, tourism_receipts) %>%
+  pivot_wider(
+    names_from = year,
+    values_from = tourism_receipts,
+    names_prefix = "receipts_"
+  ) %>%
+  filter(!is.na(receipts_2019), !is.na(receipts_2020),
+         receipts_2019 > 0) %>%
+  mutate(
+    drop_abs = receipts_2020 - receipts_2019,
+    drop_pct = 100 * (receipts_2020 - receipts_2019) / receipts_2019
+  )
+
+covid_drop_receipts_top <- covid_drop_receipts %>%
+  arrange(drop_pct) %>%
+  slice_head(n = 20)
+
+covid_drop_receipts_top
+```
+
+```{r}
+ggplot(covid_drop_receipts_top,
+       aes(x = reorder(country, drop_pct), y = drop_pct)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Kraj",
+    y = "Spadek przychodów z turystyki 2020 vs 2019 [%]",
+    title = "Największe procentowe spadki przychodów z turystyki w 2020 roku"
+  )
+```
+
+## Wpływ pandemii w grupach krajów o różnej zależności od turystyki
+
+```{r}
+covid_group_drop <- tourism_grouped %>%
+  filter(year %in% c(2019, 2020), !is.na(dep_group)) %>%
+  select(country, dep_group, year, tourism_arrivals, tourism_receipts) %>%
+  pivot_wider(
+    names_from = year,
+    values_from = c(tourism_arrivals, tourism_receipts),
+    names_sep = "_"
+  ) %>%
+  filter(!is.na(tourism_arrivals_2019), !is.na(tourism_arrivals_2020),
+         tourism_arrivals_2019 > 0) %>%
+  mutate(
+    arrivals_drop_pct  = 100 * (tourism_arrivals_2020 - tourism_arrivals_2019) / tourism_arrivals_2019,
+    receipts_drop_pct  = if_else(
+      !is.na(tourism_receipts_2019) & tourism_receipts_2019 > 0,
+      100 * (tourism_receipts_2020 - tourism_receipts_2019) / tourism_receipts_2019,
+      NA_real_
+    )
+  )
+
+covid_group_drop %>%
+  group_by(dep_group) %>%
+  summarise(
+    arrivals_drop_median  = median(arrivals_drop_pct, na.rm = TRUE),
+    receipts_drop_median  = median(receipts_drop_pct, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+ggplot(covid_group_drop,
+       aes(x = dep_group, y = arrivals_drop_pct)) +
+  geom_boxplot() +
+  labs(
+    x = "Grupa krajów",
+    y = "Spadek liczby przyjazdów 2020 vs 2019 [%]",
+    title = "Rozkład spadków liczby przyjazdów w grupach krajów
+według zależności od turystyki"
+  )
+
+ggplot(covid_group_drop,
+       aes(x = dep_group, y = receipts_drop_pct)) +
+  geom_boxplot() +
+  labs(
+    x = "Grupa krajów",
+    y = "Spadek przychodów z turystyki 2020 vs 2019 [%]",
+    title = "Rozkład spadków przychodów z turystyki w grupach krajów
+według zależności od turystyki"
+  )
+```
+
+# Podsumowanie
+
+W przedstawionej rozszerzonej analizie porównawczej opisano dynamikę rok do roku, zróżnicowanie między grupami krajów o różnej zależności od turystyki oraz wpływ pandemii COVID-19 na międzynarodowy ruch turystyczny. Wyniki te stanowią bezpośrednie tło dla dalszych rozdziałów, w których budowane są modele ilościowe opisujące wpływ wskaźników makroekonomicznych na dynamikę międzynarodowego ruchu turystycznego.
