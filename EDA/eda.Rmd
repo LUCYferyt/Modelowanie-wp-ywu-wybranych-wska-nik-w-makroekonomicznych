@@ -15,6 +15,8 @@ library(tidyverse)
 library(readr)
 library(skimr)
 library(tibble)
+library(gridExtra)
+library(ggplot2)
 ```
 
 # Wprowadzenie
@@ -70,7 +72,7 @@ numeric_subset <- tourism %>%
 ```
 
 ```{r}
-descriptives <- numeric_subset %>%
+descriptives_raw <- numeric_subset %>%
   summarise(across(
     everything(),
     list(
@@ -88,8 +90,130 @@ descriptives <- numeric_subset %>%
 
 descriptives
 ```
+```{r}
+yearly_stats_raw <- tourism %>%
+  group_by(year) %>%
+  summarise(
+    across(
+      all_of(vars_to_describe),
+      list(
+        mean   = ~ mean(., na.rm = TRUE),
+        median = ~ median(., na.rm = TRUE),
+        p25    = ~ quantile(., 0.25, na.rm = TRUE),
+        p75    = ~ quantile(., 0.75, na.rm = TRUE),
+        min    = ~ min(., na.rm = TRUE),
+        max    = ~ max(., na.rm = TRUE)
+      ),
+      .names = "{.col}__{.fn}"
+    ),
+    .groups = "drop"
+  )
 
-Uzyskane statystyki opisowe mogą zostać następnie przedstawione w pracy jako tabela zbiorcza dla głównych wskaźników turystycznych i makroekonomicznych.
+yearly_stats_raw
+```
+
+```{r}
+make_stat_table <- function(stat) {
+  yearly_stats_raw %>%
+    select(year, ends_with(paste0("__", stat))) %>%
+    rename_with(
+      ~ sub(paste0("__", stat), "", .x),
+      ends_with(paste0("__", stat))
+    ) %>%
+    arrange(year)
+}
+```
+
+```{r}
+format_yearly_table <- function(df, digits = 2) {
+  df %>%
+    mutate(
+      across(
+        where(is.numeric) & !any_of("year"),
+        ~ ifelse(
+          is.na(.),
+          NA_character_,
+          formatC(., format = "f", digits = digits, big.mark = " ")
+        )
+      )
+    )
+}
+```
+
+```{r}
+
+mean_by_year    <- format_yearly_table(make_stat_table("mean"),   digits = 2)
+median_by_year  <- format_yearly_table(make_stat_table("median"), digits = 2)
+p25_by_year     <- format_yearly_table(make_stat_table("p25"),    digits = 2)
+p75_by_year     <- format_yearly_table(make_stat_table("p75"),    digits = 2)
+min_by_year     <- format_yearly_table(make_stat_table("min"),    digits = 2)
+max_by_year     <- format_yearly_table(make_stat_table("max"),    digits = 2)
+
+
+mean_by_year
+
+```
+
+
+```{r}
+dir.create("../outputs", showWarnings = FALSE)
+
+save_table_jpg <- function(df, filename, title, width = 14, height = 8) {
+  tg <- gridExtra::tableGrob(df, rows = NULL)
+  tg <- gridExtra::arrangeGrob(
+    tg,
+    top = grid::textGrob(
+      title,
+      gp = grid::gpar(fontface = "bold", cex = 1.2)
+    )
+  )
+
+  ggplot2::ggsave(
+    filename = file.path("../outputs", filename),
+    plot     = tg,
+    width    = width,
+    height   = height,
+    dpi      = 300
+  )
+}
+
+save_table_jpg(
+  mean_by_year,
+  "srednie_roczne_glowne_wskazniki.jpg",
+  "Średnie roczne wartości głównych wskaźników"
+)
+
+save_table_jpg(
+  median_by_year,
+  "median_roczne_glowne_wskazniki.jpg",
+  "Medianowe roczne wartości głównych wskaźników"
+)
+
+save_table_jpg(
+  p25_by_year,
+  "kwartyl1_roczny_glowne_wskazniki.jpg",
+  "Pierwszy kwartyl (Q1) rocznych wartości głównych wskaźników"
+)
+
+save_table_jpg(
+  p75_by_year,
+  "kwartyl3_roczny_glowne_wskazniki.jpg",
+  "Trzeci kwartyl (Q3) rocznych wartości głównych wskaźników"
+)
+
+save_table_jpg(
+  min_by_year,
+  "minimum_roczne_glowne_wskazniki.jpg",
+  "Minimalne roczne wartości głównych wskaźników"
+)
+
+save_table_jpg(
+  max_by_year,
+  "maksimum_roczne_glowne_wskazniki.jpg",
+  "Maksymalne roczne wartości głównych wskaźników"
+)
+
+```
 
 # Rozkłady zmiennych
 
