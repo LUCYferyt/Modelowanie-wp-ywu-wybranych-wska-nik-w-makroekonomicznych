@@ -21,7 +21,7 @@ library(ggplot2)
 
 # Wprowadzenie
 
-Celem niniejszego rozdziału jest przeprowadzenie klasycznej eksploracyjnej analizy danych (EDA) skoncentrowanej na samych zmiennych opisujących międzynarodowy ruch turystyczny oraz wybrane wskaźniki makroekonomiczne. Zagadnienia związane ze strukturą zbioru, brakami danych i procedurami czyszczenia zostały szczegółowo omówione w osobnym rozdziale. W dalszej części skupiamy się na skalach wartości, rozkładach, prostych transformacjach oraz podstawowych zależnościach pomiędzy zmiennymi.
+Celem rozdziału jest przeprowadzenie klasycznej eksploracyjnej analizy danych (EDA) skoncentrowanej na samych zmiennych opisujących międzynarodowy ruch turystyczny oraz wybrane wskaźniki makroekonomiczne. Zagadnienia związane ze strukturą zbioru, brakami danych i procedurami czyszczenia zostały szczegółowo omówione w osobnym rozdziale. W dalszej części skupiamy się na skalach wartości, rozkładach, prostych transformacjach oraz podstawowych zależnościach pomiędzy zmiennymi.
 
 # Struktura zbioru danych – zarys
 
@@ -49,8 +49,6 @@ tourism %>%
 skim(tourism)
 ```
 
-Powyższe zestawienia służą jako punkt wyjścia do dalszej, bardziej szczegółowej analizy zmiennych.
-
 # Statystyki opisowe głównych wskaźników
 
 ## Wybór zmiennych i zbiorcze statystyki
@@ -72,6 +70,7 @@ numeric_subset <- tourism %>%
 ```
 
 ```{r}
+
 descriptives_raw <- numeric_subset %>%
   summarise(across(
     everything(),
@@ -87,6 +86,37 @@ descriptives_raw <- numeric_subset %>%
     ),
     .names = "{.col}_{.fn}"
   ))
+
+descriptives <- descriptives_raw %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = c("variable", "stat"),
+    names_pattern = "(.+)_([^_]+)$",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>%
+  arrange(variable) %>%
+  mutate(
+    n = as.integer(n),
+    across(
+      c(min, p25, median, p75, max, mean, sd),
+      ~ round(.x, 2)
+    )
+  ) %>%
+  mutate(
+    across(
+      c(min, p25, median, p75, max, mean, sd),
+      ~ format(
+        .x,
+        big.mark = " ",
+        decimal.mark = ",",
+        scientific = FALSE
+      )
+    )
+  )
 
 descriptives
 ```
@@ -213,6 +243,13 @@ save_table_jpg(
   "Maksymalne roczne wartości głównych wskaźników"
 )
 
+save_table_jpg(
+  descriptives,
+  "statystyki_opisowe_glowne_wskazniki.jpg",
+  "Statystyki opisowe głównych wskaźników (cały okres i wszystkie kraje)"
+)
+
+
 ```
 
 # Rozkłady zmiennych
@@ -233,7 +270,7 @@ tourism_long <- tourism %>%
 ## Histogramy wartości surowych
 
 ```{r}
-ggplot(tourism_long, aes(x = value)) +
+hist_raw <- ggplot(tourism_long, aes(x = value)) +
   geom_histogram(bins = 30) +
   facet_wrap(~ variable, scales = "free") +
   labs(
@@ -241,9 +278,17 @@ ggplot(tourism_long, aes(x = value)) +
     y = "Liczba obserwacji",
     title = "Rozkłady podstawowych wskaźników (wartości surowe)"
   )
-```
 
-Histogramy surowych wartości pozwalają ocenić m.in. skalę skośności rozkładów i obecność krajów o ekstremalnie wysokich wartościach wskaźników.
+hist_raw
+
+ggplot2::ggsave(
+  filename = file.path("../outputs", "hist_rozkłady_surowe.jpg"),
+  plot     = hist_raw,
+  width    = 14,
+  height   = 8,
+  dpi      = 300
+)
+```
 
 ## Histogramy po transformacji logarytmicznej
 
@@ -252,7 +297,7 @@ tourism_long_log <- tourism_long %>%
   filter(value > 0) %>%
   mutate(log10_value = log10(value))
 
-ggplot(tourism_long_log, aes(x = log10_value)) +
+hist_log <- ggplot(tourism_long_log, aes(x = log10_value)) +
   geom_histogram(bins = 30) +
   facet_wrap(~ variable, scales = "free") +
   labs(
@@ -260,9 +305,17 @@ ggplot(tourism_long_log, aes(x = log10_value)) +
     y = "Liczba obserwacji",
     title = "Rozkłady podstawowych wskaźników po transformacji logarytmicznej"
   )
-```
 
-Transformacja logarytmiczna umożliwia porównywanie zmiennych różniących się rzędami wielkości i zmniejsza wpływ obserwacji skrajnych na kształt rozkładów.
+hist_log
+
+ggplot2::ggsave(
+  filename = file.path("../outputs", "hist_rozkłady_log10.jpg"),
+  plot     = hist_log,
+  width    = 14,
+  height   = 8,
+  dpi      = 300
+)
+```
 
 # Zależności między wskaźnikami
 
@@ -289,7 +342,7 @@ cor_long <- cor_mat %>%
     values_to = "cor"
   )
 
-ggplot(cor_long, aes(x = var1, y = var2, fill = cor)) +
+cor_plot <- ggplot(cor_long, aes(x = var1, y = var2, fill = cor)) +
   geom_tile() +
   scale_fill_gradient2(limits = c(-1, 1)) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
@@ -299,9 +352,18 @@ ggplot(cor_long, aes(x = var1, y = var2, fill = cor)) +
     fill = "Korelacja",
     title = "Macierz korelacji wybranych wskaźników"
   )
+
+cor_plot
+
+ggplot2::ggsave(
+  filename = file.path("../outputs", "heatmap_macierz_korelacji.jpg"),
+  plot     = cor_plot,
+  width    = 14,
+  height   = 8,
+  dpi      = 300
+)
 ```
 
-Heatmapa  macierzy korelacji pozwala szybko wskazać pary zmiennych o najsilniejszych powiązaniach dodatnich i ujemnych.
 
 ## Wykres rozrzutu: logarytm PKB a logarytm liczby przyjazdów
 
@@ -315,16 +377,67 @@ scatter_data <- tourism %>%
     log10_arrivals = log10(tourism_arrivals)
   )
 
-ggplot(scatter_data, aes(x = log10_gdp, y = log10_arrivals)) +
+scatter_plot <- ggplot(scatter_data, aes(x = log10_gdp, y = log10_arrivals)) +
   geom_point(alpha = 0.4) +
   labs(
     x = "log10(PKB)",
     y = "log10(liczby przyjazdów)",
     title = "Zależność między wielkością gospodarki a skalą ruchu turystycznego"
   )
-```
 
-Taki wykres rozrzutu ilustruje powiązanie pomiędzy wielkością gospodarki a poziomem międzynarodowego ruchu turystycznego.
+scatter_plot
+
+ggplot2::ggsave(
+  filename = file.path("../outputs", "scatter_log_pkb_przyjazdy.jpg"),
+  plot     = scatter_plot,
+  width    = 14,
+  height   = 8,
+  dpi      = 300
+)
+```
+```{r}
+## Kraje o ponadprzeciętnie wysokim udziale turystyki w PKB
+
+top_tourism_share <- tourism %>%
+  filter(
+    !is.na(tourism_receipts),
+    !is.na(gdp),
+    tourism_receipts > 0,
+    gdp > 0
+  ) %>%
+  mutate(receipts_share_gdp = tourism_receipts / gdp * 100) %>%
+  group_by(country) %>%
+  summarise(
+    n_years          = n(),                                  
+    mean_share_gdp   = mean(receipts_share_gdp, na.rm = TRUE) 
+  ) %>%
+  ungroup() %>%
+  arrange(desc(mean_share_gdp))
+
+top_tourism_share %>%
+  slice_head(n = 10)
+
+```
+```{r}
+top_tourism_share_tab <- top_tourism_share %>%
+  slice_head(n = 10) %>%
+  mutate(
+    mean_share_gdp = round(mean_share_gdp, 2),
+    mean_share_gdp = format(
+      mean_share_gdp,
+      big.mark     = " ",
+      decimal.mark = ",",
+      scientific   = FALSE
+    )
+  )
+
+save_table_jpg(
+  top_tourism_share_tab,
+  "top_kraje_udzial_turystyki_w_pkb.jpg",
+  "Kraje o najwyższym średnim udziale przychodów z turystyki w PKB"
+)
+
+```           
 
 # Średnie wartości wskaźników w czasie
 
@@ -351,7 +464,7 @@ avg_by_year_long <- avg_by_year %>%
 ## Wykres średnich rocznych wartości wskaźników
 
 ```{r}
-ggplot(avg_by_year_long, aes(x = year, y = value)) +
+avg_plot <- ggplot(avg_by_year_long, aes(x = year, y = value)) +
   geom_line() +
   facet_wrap(~ variable, scales = "free_y") +
   labs(
@@ -359,10 +472,14 @@ ggplot(avg_by_year_long, aes(x = year, y = value)) +
     y = "Średnia wartość",
     title = "Średnie roczne wartości wybranych wskaźników"
   )
+
+avg_plot
+
+ggplot2::ggsave(
+  filename = file.path("../outputs", "wykres_srednie_roczne_glowne_wskazniki.jpg"),
+  plot     = avg_plot,
+  width    = 14,
+  height   = 8,
+  dpi      = 300
+)
 ```
-
-Wykres średnich rocznych wartości wskaźników stanowi punkt wyjścia do dalszej analizy dynamiki w czasie, w tym do oceny wpływu kryzysów gospodarczych i zdrowotnych na międzynarodowy ruch turystyczny.
-
-# Podsumowanie
-
-W niniejszym rozdziale skoncentrowano się na opisowej charakterystyce zmiennych: przedstawiono zbiorcze statystyki opisowe, rozkłady surowych wartości i ich logarytmów, podstawowe zależności korelacyjne oraz średnie roczne wartości wybranych wskaźników. Uzyskane wyniki tworzą tło dla bardziej zaawansowanych analiz porównawczych oraz modelowania wpływu wskaźników makroekonomicznych na dynamikę międzynarodowego ruchu turystycznego.
