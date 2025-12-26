@@ -1,7 +1,7 @@
 Model,Test,Wartość p
-System-GMM: przyjazdy,AR(1) Arellano-Bond,1.3968112839841345e-5
-System-GMM: przyjazdy,AR(2) Arellano-Bond,0.8465188440331828
-System-GMM: przyjazdy,Test Sargana (instrumenty),0.06079460212732164
-System-GMM: wpływy,AR(1) Arellano-Bond,0.6415870421087735
-System-GMM: wpływy,AR(2) Arellano-Bond,0.0018334717825860111
-System-GMM: wpływy,Test Sargana (instrumenty),0.008384807059178686
+System-GMM: przyjazdy,AR(1) Arellano-Bond,1.593345490398951e-5
+System-GMM: przyjazdy,AR(2) Arellano-Bond,0.8054272294268454
+System-GMM: przyjazdy,Test Sargana (instrumenty),0.04940665787825545
+System-GMM: wpływy,AR(1) Arellano-Bond,0.5580175411154489
+System-GMM: wpływy,AR(2) Arellano-Bond,0.0022258113315405015
+System-GMM: wpływy,Test Sargana (instrumenty),0.003728779752401707
