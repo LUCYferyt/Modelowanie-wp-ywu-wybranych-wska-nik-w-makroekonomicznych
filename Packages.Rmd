@@ -5,12 +5,20 @@ date: "2025-11-02"
 ---
 
 ```{r}
-install.packages(c(
-  "tidyverse","janitor","lubridate","readr","stringr",
-  "skimr","gt","GGally","corrplot","scales","plotly",
-  "sf","rnaturalearth","rnaturalearthdata",
-  "plm","fixest","broom","performance",
-  "shiny","shinydashboard","thematic","DT"
-))
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(timeout = 300)
+
+pkgs <- c(
+  "xfun", "knitr", "litedown", "gt", "scales",
+  "tidyverse", "janitor", "zoo",
+  "GGally", "corrplot", "plotly",
+  "sf", "rnaturalearth", "rnaturalearthdata",
+  "plm", "fixest", "broom", "performance",
+  "DT", "thematic", "skimr", "webshot2"
+)
+
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
 
 ```

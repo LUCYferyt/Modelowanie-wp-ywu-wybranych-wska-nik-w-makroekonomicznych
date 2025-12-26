@@ -1,0 +1,345 @@
+---
+title: "Eksploracyjna analiza danych - rozszerzona"
+author: "Łucja Wuls"
+date: "2025-11-28"
+---
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(scales)
+library(gt)
+```
+
+```{r}
+var_pl <- c(
+  gdp = "PKB (USD)",
+  inflation = "Inflacja (CPI, %)",
+  unemployment = "Stopa bezrobocia (%)",
+  tourism_arrivals = "Przyjazdy turystów (liczba)",
+  tourism_receipts = "Wpływy z turystyki (USD)",
+  tourism_expenditures = "Wydatki turystyczne (USD)",
+  tourism_exports = "Eksport usług turystycznych (USD)",
+  tourism_departures = "Wyjazdy turystów (liczba)"
+)
+
+label_var <- function(x) dplyr::recode(x, !!!var_pl, .default = x)
+
+
+var_scale <- c(
+  gdp = 1e9,
+  tourism_receipts = 1e9,
+  tourism_arrivals = 1e6,
+  tourism_departures = 1e6,
+  inflation = 1,
+  unemployment = 1,
+  tourism_expenditures = 1,
+  tourism_exports = 1
+)
+```
+
+```{r}
+kolor_blekit <- "#7ea1ed"  
+kolor_granat <- "#3f51b5"  
+kolor_ryzyko <- "#d88a8a" 
+kolor_neutral <- "#546e7a"
+
+theme_inz <- function() {
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, color = "#2c3e50"),
+      plot.subtitle = element_text(size = 10, color = "#546e7a", margin = margin(b = 15)),
+      strip.background = element_rect(fill = "#f8f9fa", color = NA),
+      strip.text = element_text(face = "bold", size = 10, color = "#34495e"),
+      panel.grid.major = element_line(color = "#f0f0f0"),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(size = 9, face = "italic"),
+      axis.text = element_text(color = "#626d6e")
+    )
+}
+```
+
+
+```{r}
+tourism <- readr::read_csv("../data/clean/world_tourism_economy_data_clean.csv") %>%
+  janitor::clean_names()
+
+tourism_panel <- tourism %>% arrange(country, year)
+
+# Obliczenia YOY
+tourism_yoy <- tourism_panel %>%
+  group_by(country) %>%
+  mutate(
+    arrivals_yoy_pct = (tourism_arrivals / dplyr::lag(tourism_arrivals) - 1) * 100,
+    receipts_yoy_pct = (tourism_receipts / dplyr::lag(tourism_receipts) - 1) * 100
+  ) %>%
+  ungroup()
+```
+
+###Rozkłady przyrostów
+
+```{r}
+plot_yoy_arrivals <- tourism_yoy %>%
+  filter(!is.na(arrivals_yoy_pct)) %>%
+  ggplot(aes(x = factor(year), y = arrivals_yoy_pct)) +
+  geom_boxplot(fill = kolor_blekit, alpha = 0.7, outlier.alpha = 0.2) +
+  coord_cartesian(ylim = c(-100, 200)) +
+  theme_inz() +
+  labs(title = "Dynamika zmian liczby przyjazdów turystycznych w ujęciu rocznym",
+       subtitle = "Rozkład wartości procentowych dla wszystkich badanych jednostek terytorialnych",
+       x = "Rok budżetowy", y = "Zmiana rok do roku (%)")
+
+ggsave("../outputs/boxplot_przyrost_przyjazdy_rok_do_roku.png", plot_yoy_arrivals, width = 12, height = 7)
+```
+
+
+###Mediana i rozstęp
+
+```{r}
+yoy_summary_long <- tourism_yoy %>%
+  group_by(year) %>%
+  summarise(
+    "Przyjazdy turystyczne" = median(arrivals_yoy_pct, na.rm = TRUE),
+    "Przychody z turystyki" = median(receipts_yoy_pct, na.rm = TRUE),
+    p25 = quantile(arrivals_yoy_pct, 0.25, na.rm = TRUE),
+    p75 = quantile(arrivals_yoy_pct, 0.75, na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    cols = c("Przyjazdy turystyczne", "Przychody z turystyki"),
+    names_to = "variable",
+    values_to = "median"
+  )
+```
+
+```{r}
+
+plot_yoy_summary <- yoy_summary_long %>%
+  ggplot(aes(x = year, y = median, colour = variable, fill = variable)) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  scale_color_manual(values = c("Przyjazdy turystyczne" = kolor_granat, 
+                                 "Przychody z turystyki" = kolor_blekit)) +
+  scale_fill_manual(values = c("Przyjazdy turystyczne" = kolor_granat, 
+                                "Przychody z turystyki" = kolor_blekit)) +
+  theme_inz() +
+  scale_y_continuous(breaks = seq(-80, 40, by = 20)) +
+  scale_x_continuous(breaks = seq(2000, 2020, by = 5)) +
+  labs(
+    title = "Dynamika zmian wskaźników turystycznych w ujęciu rocznym",
+    subtitle = "Mediana przyrostów oraz rozstęp międzykwartylowy (IQR) dla wszystkich badanych jednostek",
+    x = "Rok kalendarzowy",
+    y = "Przyrost rok do roku (%)",
+    colour = "Wskaźnik",
+    fill = "Wskaźnik"
+  )
+
+ggsave("../outputs/przyrosty_mediana_i_iqr_przyjazdy_przychody.png", plot_yoy_summary, width = 12, height = 6,)
+```
+
+###Średnie w grupach
+
+```{r}
+#podział
+tourism_dep <- tourism_panel %>%
+  group_by(country) %>%
+  summarise(mean_exp = mean(tourism_exports, na.rm = TRUE)) %>%
+  mutate(dep_group = case_when(
+    is.na(mean_exp) ~ NA_character_,
+    mean_exp < 10 ~ "Niska", 
+    mean_exp < 20 ~ "Średnia", 
+    TRUE ~ "Wysoka"
+  ))
+
+
+tourism_panel <- tourism_panel %>%
+  select(-any_of("dep_group")) %>% 
+  left_join(tourism_dep %>% select(country, dep_group), by = "country")
+
+```
+
+```{r}
+tabela_prosta_dane <- tourism_panel %>%
+  distinct(country, dep_group) %>%
+  count(dep_group, name = "liczba") %>%
+  mutate(dep_group = case_when(
+    is.na(dep_group) ~ "Brak danych (NA)",
+    dep_group == "Niska" ~ "Niska zależność",
+    dep_group == "Średnia" ~ "Średnia zależność",
+    dep_group == "Wysoka" ~ "Wysoka zależność",
+    TRUE ~ dep_group
+  )) %>%
+  mutate(dep_group = fct_relevel(dep_group, "Niska zależność", "Średnia zależność", "Wysoka zależność", "Brak danych (NA)")) %>%
+  arrange(dep_group)
+```
+
+```{r}
+Sys.setenv(CHROMOTE_CHROME = "C:\\Users\\lucja\\AppData\\Local\\BraveSoftware\\Brave-Browser\\Application\\brave.exe")
+
+tabela_prosta_gt <- tabela_prosta_dane %>%
+  gt() %>%
+  tab_header(
+    title = md("**Liczebność grup zależności od turystyki**")
+  ) %>%
+  cols_label(
+    dep_group = "Kategoria",
+    liczba = "Liczba państw"
+  ) %>%
+  # Stylizacja Clean White
+  tab_options(
+    table.width = px(400),
+    column_labels.background.color = "#f9f9f9",
+    column_labels.font.weight = "bold",
+    table.border.top.style = "none",
+    table.border.bottom.style = "solid",
+    table.border.bottom.width = px(2),
+    table.border.bottom.color = "black"
+  ) %>%
+  cols_align(align = "left", columns = dep_group) %>%
+  cols_align(align = "center", columns = liczba)
+
+# 3. Zapis tabeli
+gtsave(tabela_prosta_gt, "../outputs/tabela_liczebnosc_grup.png")
+
+# Wyświetlenie w konsoli/Viewerze
+tabela_prosta_gt
+
+```
+
+```{r}
+plot_group_avg <- tourism_panel %>%
+  filter(!is.na(dep_group)) %>%
+  group_by(dep_group, year) %>%
+  summarise(Przyjazdy = mean(tourism_arrivals, na.rm = TRUE),
+            Przychody = mean(tourism_receipts, na.rm = TRUE), .groups = "drop") %>%
+  pivot_longer(c(Przyjazdy, Przychody)) %>%
+  ggplot(aes(x = year, y = value, color = fct_relevel(dep_group, "Niska", "Średnia", "Wysoka"))) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ name, scales = "free_y") +
+  scale_color_manual(values = c("Niska" = "#b0bec5", "Średnia" = kolor_blekit, "Wysoka" = kolor_granat)) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_si(" "))) +
+  theme_inz() +
+  labs(title = "Kształtowanie się średnich wartości wskaźników turystycznych",
+       subtitle = "Podział według stopnia zależności gospodarki od eksportu usług turystycznych",
+       x = "Rok", y = "Średnia wartość (skala bezwzględna)", color = "Stopień zależności")
+
+ggsave("../outputs/srednie_wskazniki_w_grupach_krajow.png", plot_group_avg, width = 12, height = 6)
+```
+
+###Poziom przed pandemią
+
+```{r}
+plot_pre_covid <- tourism_panel %>%
+  filter(!is.na(dep_group), year >= 2017, year <= 2019) %>%
+  group_by(country, dep_group) %>%
+  summarise(Przyjazdy = mean(tourism_arrivals, na.rm = TRUE),
+            Przychody = mean(tourism_receipts, na.rm = TRUE), .groups = "drop") %>%
+  pivot_longer(c(Przyjazdy, Przychody)) %>%
+  ggplot(aes(x = fct_relevel(dep_group, "Niska", "Średnia", "Wysoka"), y = value)) +
+  geom_boxplot(fill = kolor_blekit, alpha = 0.6) +
+  facet_wrap(~ name, scales = "free_y") +
+  scale_y_log10(labels = label_number(scale_cut = cut_si(" "))) +
+  theme_inz() +
+  labs(title = "Poziom wskaźników przed pandemią (skala log10)", x = "Grupa zależności")
+
+ggsave("../outputs/poziom_przed_pandemia_w_grupach.png", plot_pre_covid, width = 10, height = 6)
+
+```
+
+###Zmiany globalne 2019-2020
+
+```{r}
+global_19_20 <- tourism_panel %>%
+  filter(year %in% c(2019, 2020)) %>%
+  group_by(year) %>%
+  summarise(
+    PKB = mean(gdp, na.rm = TRUE) / 1e9,
+    Przyjazdy = mean(tourism_arrivals, na.rm = TRUE) / 1e6,
+    Przychody = mean(tourism_receipts, na.rm = TRUE) / 1e9,
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(PKB, Przyjazdy, Przychody),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    variable = factor(variable, levels = c("PKB", "Przyjazdy", "Przychody")),
+    year = as.integer(year)
+  )
+```
+
+```{r}
+plot_global_19_20 <- global_19_20 %>%
+  ggplot(aes(x = factor(year), y = value, fill = variable)) +
+  geom_col(position = "dodge", alpha = 0.9, width = 0.7) +
+  facet_wrap(~ variable, scales = "free_y") + 
+  scale_fill_manual(values = c("PKB" = kolor_granat, 
+                               "Przyjazdy" = kolor_blekit, 
+                               "Przychody" = kolor_neutral)) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_si(" "))) +
+  theme_inz() +
+  theme(legend.position = "none") + 
+  labs(
+    title = "Analiza porównawcza kluczowych wskaźników w okresie pandemii (2019–2020)",
+    subtitle = "Wpływ restrykcji na średnie wartości (uwaga: różne skale osi Y dla lepszej widoczności)",
+    x = "Rok", 
+    y = "Wartość średnia"
+  )
+
+ggsave("../outputs/srednie_globalne_2019_2020.png", plot_global_19_20, width = 12, height = 6)
+
+```
+
+###Rozkład spadków
+
+```{r}
+drops <- tourism_panel %>%
+  filter(year %in% c(2019, 2020)) %>%
+  select(country, dep_group, year, tourism_arrivals, tourism_receipts) %>%
+  pivot_wider(names_from = year, values_from = c(tourism_arrivals, tourism_receipts)) %>%
+  mutate(drop_arr = (tourism_arrivals_2020 / tourism_arrivals_2019 - 1) * 100,
+         drop_rec = (tourism_receipts_2020 / tourism_receipts_2019 - 1) * 100)
+
+#przyjazdy
+plot_drop_arr <- ggplot(drops, aes(x = drop_arr)) +
+  geom_histogram(fill = kolor_blekit, color = "white", bins = 30) +
+  theme_inz() + labs(title = "Rozkład spadków liczby przyjazdów (2020 vs 2019)", x = "Spadek (%)", y = "Liczba krajów")
+
+# przychody
+plot_drop_rec <- ggplot(drops, aes(x = drop_rec)) +
+  geom_histogram(fill = kolor_granat, color = "white", bins = 30) +
+  theme_inz() + labs(title = "Rozkład spadków przychodów (2020 vs 2019)", x = "Spadek (%)", y = "Liczba krajów")
+
+ggsave("../outputs/spadki_przyjazdow_histogram.png", plot_drop_arr, width = 12, height = 6)
+ggsave("../outputs/spadki_przychodow_histogram.png", plot_drop_rec,  width = 12, height = 6)
+```
+
+```{r}
+plot_drops_combined <- drops %>%
+  pivot_longer(c(drop_arr, drop_rec), names_to = "typ", values_to = "spadek") %>%
+  mutate(typ = ifelse(typ == "drop_arr", "Spadek liczby przyjazdów (%)", "Spadek przychodów (%)")) %>%
+  ggplot(aes(x = spadek, fill = typ)) +
+  geom_histogram(color = "white", bins = 25, show.legend = FALSE) +
+  facet_wrap(~ typ, scales = "free") +
+  scale_fill_manual(values = c(kolor_blekit, kolor_granat)) +
+  theme_inz() +
+  labs(title = "Częstotliwość występowania spadków wartości wskaźników w roku 2020",
+       subtitle = "Rozkład zmian procentowych w relacji do roku bazowego 2019",
+       x = "Wartość spadku (%)", y = "Liczba państw")
+
+ggsave("../outputs/histogramy_spadkow_2020.png", plot_drops_combined, width = 12, height = 6)
+```
+
+###Spadki w grupach
+
+```{r}
+plot_group_drop <- drops %>%
+  filter(!is.na(dep_group)) %>%
+  ggplot(aes(x = fct_relevel(dep_group, "Niska", "Średnia", "Wysoka"), y = drop_rec)) +
+  geom_boxplot(fill = kolor_granat, alpha = 0.7) +
+  theme_inz() +
+  labs(title = "Spadki przychodów według grup zależności", x = "Zależność", y = "Spadek (%)")
+
+ggsave("../outputs/spadki_przychodow_2019_2020_w_grupach.png", plot_group_drop,  width = 12, height = 6)
+```

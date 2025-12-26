@@ -1,0 +1,998 @@
+---
+title: "Prognozy międzynarodowego ruchu turystycznego"
+author: "Łucja Wuls"
+date: "2025-12-26"
+---
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(scales)
+library(forecast)
+library(gt)
+```
+
+```{r}
+kolor_blekit <- "#7ea1ed"  
+kolor_granat <- "#3f51b5"  
+kolor_ryzyko <- "#d88a8a" 
+kolor_neutral <- "#546e7a"
+
+theme_inz <- function() {
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, color = "#2c3e50"),
+      plot.subtitle = element_text(size = 10, color = kolor_neutral, margin = margin(b = 15)),
+      strip.background = element_rect(fill = "#f8f9fa", color = NA),
+      strip.text = element_text(face = "bold", size = 10, color = "#34495e"),
+      panel.grid.major = element_line(color = "#f0f0f0"),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(size = 9, face = "italic"),
+      axis.text = element_text(color = "#626d6e")
+    )
+}
+```
+
+```{r}
+kraje_pl <- c(
+  "Spain" = "Hiszpania",
+  "France" = "Francja",
+  "United States" = "Stany Zjednoczone",
+  "Poland" = "Polska"
+)
+
+label_country <- function(x) dplyr::recode(x, !!!kraje_pl, .default = x)
+```
+
+```{r}
+AICc_safe <- function(model) {
+  if (is.null(model)) return(NA_real_)
+
+  aicc_fun <- tryCatch(get("AICc", envir = asNamespace("forecast"), inherits = FALSE),
+                       error = function(e) NULL)
+  if (!is.null(aicc_fun)) return(aicc_fun(model))
+
+  aic_obj <- tryCatch(stats::AIC(model), error = function(e) NA_real_)
+  aic <- suppressWarnings(as.numeric(aic_obj)[1])
+  k   <- attr(aic_obj, "df")
+  if (is.null(k) || is.na(k)) k <- tryCatch(length(stats::coef(model)), error = function(e) NA_real_)
+  n   <- tryCatch(length(stats::residuals(model)), error = function(e) NA_integer_)
+
+  if (is.na(aic) || is.na(k) || is.na(n) || (n - k - 1) <= 0) return(aic)
+  aic + (2 * k * (k + 1)) / (n - k - 1)
+}
+```
+
+```{r}
+dir.create("../outputs", showWarnings = FALSE)
+
+save_plot <- function(p, filename, width = 9, height = 5) {
+  ggsave(
+    filename = file.path("../outputs", filename),
+    plot = p, width = width, height = height, dpi = 300
+  )
+}
+
+var_pl <- c(
+  gdp = "PKB (USD)",
+  inflation = "Inflacja (CPI, %)",
+  unemployment = "Stopa bezrobocia (%)",
+  tourism_arrivals = "Przyjazdy turystów (liczba)",
+  tourism_receipts = "Wpływy z turystyki (USD)",
+  tourism_expenditures = "Wydatki turystyczne (USD)",
+  tourism_exports = "Eksport usług turystycznych (USD)",
+  tourism_departures = "Wyjazdy turystów (liczba)"
+)
+
+label_var <- function(x) dplyr::recode(x, !!!var_pl, .default = x)
+
+polonizuj_tabele <- function(df) {
+  df %>%
+    mutate(Zmienna = label_var(Zmienna)) %>%
+    relocate(Zmienna)
+}
+```
+
+```{r}
+path_candidates <- c("../data/clean/world_tourism_economy_data_clean.csv")
+
+data_path <- path_candidates[file.exists(path_candidates)][1]
+stopifnot(!is.na(data_path))
+
+tourism_clean <- readr::read_csv(data_path, show_col_types = FALSE) %>%
+  clean_names()
+
+max_year_tourism <- tourism_clean %>%
+  summarise(
+    max_arrivals = max(year[!is.na(tourism_arrivals)], na.rm = TRUE),
+    max_receipts = max(year[!is.na(tourism_receipts)], na.rm = TRUE)
+  )
+max_year_tourism
+```
+
+
+```{r}
+build_country_series <- function(df, country_name, value_col = "tourism_arrivals", min_len = 10) {
+  d_obs <- df %>%
+    filter(country == country_name) %>%
+    select(year, value = all_of(value_col)) %>%
+    filter(!is.na(value), value > 0) %>%
+    arrange(year)
+
+  if (nrow(d_obs) < min_len) return(NULL)
+
+  d_run <- d_obs %>%
+    mutate(gap = c(TRUE, diff(year) != 1),
+           grp = cumsum(gap))
+
+  run_stats <- d_run %>%
+    group_by(grp) %>%
+    summarise(n = n(), start = min(year), end = max(year), .groups = "drop") %>%
+    arrange(desc(end), desc(n))
+
+
+  run_ok <- run_stats %>% filter(n >= min_len)
+
+  if (nrow(run_ok) > 0) {
+    grp_best <- run_ok$grp[1]
+  } else {
+    best <- run_stats %>% slice(1)
+    if (best$n < 6) return(NULL)
+    message("Uwaga: kraj ", country_name,
+            " - brak spójnego fragmentu o długości >= ", min_len,
+            ". Użyto fragmentu ", best$start, "-", best$end,
+            " (n = ", best$n, ").")
+    grp_best <- best$grp
+  }
+
+  d_model <- d_run %>%
+    filter(grp == grp_best) %>%
+    select(year, value)
+
+  ln_value <- log(d_model$value)
+  if (any(!is.finite(ln_value))) return(NULL)
+
+  y_ts <- ts(ln_value, start = min(d_model$year), frequency = 1)
+
+  list(
+    df_obs = d_obs,
+    df_model = d_model,
+    years = d_model$year,
+    y_ts = y_ts,
+    end_year = max(d_model$year, na.rm = TRUE)
+  )
+}
+```
+
+```{r}
+fit_forecast_bundle <- function(y_ts, years, h = 5, level = 80, shock_year = 2020) {
+
+  fit_safe <- function(expr) tryCatch(expr, error = function(e) NULL)
+
+  # ETS
+  fit_ets <- fit_safe(forecast::ets(y_ts))
+  fc_ets  <- if (!is.null(fit_ets)) forecast::forecast(fit_ets, h = h, level = level) else NULL
+
+  # ARIMA
+  fit_arima <- fit_safe(forecast::auto.arima(y_ts, seasonal = FALSE, stepwise = TRUE, approximation = FALSE))
+  fc_arima  <- if (!is.null(fit_arima)) forecast::forecast(fit_arima, h = h, level = level) else NULL
+
+  # ARIMAX z interwencją: pandemia jako anomalia
+  shock <- as.integer(years == shock_year)
+  fit_arimax <- NULL
+  fc_arimax  <- NULL
+  if (sum(shock) > 0 && sum(shock) < length(shock)) {
+    fit_arimax <- fit_safe(
+      forecast::auto.arima(y_ts, xreg = shock, seasonal = FALSE, stepwise = TRUE, approximation = FALSE)
+    )
+    if (!is.null(fit_arimax)) {
+      shock_future <- rep(0, h)
+      fc_arimax <- forecast::forecast(fit_arimax, xreg = shock_future, h = h, level = level)
+    }
+  }
+
+ 
+  pre_idx <- which(years < shock_year)
+
+  fit_noshock_ets <- NULL
+  fc_noshock_ets  <- NULL
+
+  fit_noshock_arima <- NULL
+  fc_noshock_arima  <- NULL
+
+  if (length(pre_idx) >= 8) {
+    y_pre <- ts(as.numeric(y_ts)[pre_idx], start = years[pre_idx][1], frequency = 1)
+
+    steps_to_end <- max(years) - max(years[pre_idx])
+    steps_to_end <- max(0, steps_to_end)
+
+    # ETS < 2020
+    fit_noshock_ets <- fit_safe(forecast::ets(y_pre))
+    if (!is.null(fit_noshock_ets)) {
+      fc_noshock_ets <- forecast::forecast(fit_noshock_ets, h = steps_to_end + h, level = level)
+    }
+
+    # ARIMA < 2020 
+    fit_noshock_arima <- fit_safe(
+      forecast::auto.arima(y_pre, seasonal = FALSE, stepwise = TRUE, approximation = FALSE)
+    )
+    if (!is.null(fit_noshock_arima)) {
+      fc_noshock_arima <- forecast::forecast(fit_noshock_arima, h = steps_to_end + h, level = level)
+    }
+  }
+
+  model_rows <- tibble(
+    Model = c(
+      "ETS",
+      "ARIMA (benchmark)",
+      "ARIMAX (impuls 2020)",
+      "Wariant: bez szoku (ETS < 2020)",
+      "Wariant: bez szoku (ARIMA < 2020)"
+    ),
+    AICc = c(
+      if (!is.null(fit_ets)) AICc_safe(fit_ets) else NA_real_,
+      if (!is.null(fit_arima)) AICc_safe(fit_arima) else NA_real_,
+      if (!is.null(fit_arimax)) AICc_safe(fit_arimax) else NA_real_,
+      if (!is.null(fit_noshock_ets)) AICc_safe(fit_noshock_ets) else NA_real_,
+      if (!is.null(fit_noshock_arima)) AICc_safe(fit_noshock_arima) else NA_real_
+    )
+  )
+
+  list(
+    fits = list(
+      ets = fit_ets,
+      arima = fit_arima,
+      arimax = fit_arimax,
+      noshock_ets = fit_noshock_ets,
+      noshock_arima = fit_noshock_arima
+    ),
+    forecasts = list(
+      ets = fc_ets,
+      arima = fc_arima,
+      arimax = fc_arimax,
+      noshock_ets = fc_noshock_ets,
+      noshock_arima = fc_noshock_arima
+    ),
+    metrics = model_rows
+  )
+}
+```
+
+```{r}
+forecast_country_bundle <- function(country_name, value_col = "tourism_arrivals", h = 5, level = 80, shock_year = 2020) {
+  s <- build_country_series(tourism_clean, country_name, value_col = value_col)
+  if (is.null(s)) return(NULL)
+
+  b <- fit_forecast_bundle(s$y_ts, s$years, h = h, level = level, shock_year = shock_year)
+  b$series <- s
+  b$value_col <- value_col
+  b$country <- country_name
+  b$shock_year <- shock_year
+  b
+}
+```
+
+```{r}
+plot_country_forecast_main <- function(bundle, level = 80, y_lim = NULL, y_auto = FALSE, y_pad = 0.06) {
+  s <- bundle$series
+  var_label <- label_var(bundle$value_col)
+  shock_year <- bundle$shock_year
+  end_year <- s$end_year
+
+  df_obs <- s$df_obs %>% mutate(ln_value = log(value))
+  df_model <- s$df_model %>% mutate(ln_value = log(value))
+
+  fc_ets   <- bundle$forecasts$ets
+  fc_arimax <- bundle$forecasts$arimax
+
+  df_fc <- NULL
+  if (!is.null(fc_ets)) {
+    df_fc <- tibble(
+      year = (end_year + 1):(end_year + length(fc_ets$mean)),
+      mean = as.numeric(fc_ets$mean),
+      lo   = as.numeric(fc_ets$lower[, 1]),
+      hi   = as.numeric(fc_ets$upper[, 1])
+    )
+  }
+
+  df_arimax <- NULL
+  if (!is.null(fc_arimax)) {
+    df_arimax <- tibble(
+      year = (end_year + 1):(end_year + length(fc_arimax$mean)),
+      mean = as.numeric(fc_arimax$mean)
+    )
+  }
+
+  gg <- ggplot() +
+    annotate("rect",
+             xmin = shock_year - 0.5, xmax = shock_year + 0.5,
+             ymin = -Inf, ymax = Inf,
+             fill = kolor_ryzyko, alpha = 0.18) +
+    geom_point(data = df_obs, aes(x = year, y = ln_value),
+               color = kolor_neutral, alpha = 0.35, size = 1.6) +
+    geom_line(
+      data = df_model,
+      aes(x = year, y = ln_value,
+          colour = "Dane (fragment estymacji)",
+          linetype = "Dane (fragment estymacji)"),
+      linewidth = 0.9
+    )
+
+  if (!is.null(df_fc)) {
+    gg <- gg +
+      geom_ribbon(
+        data = df_fc,
+        aes(x = year, ymin = lo, ymax = hi, fill = "Przedział niepewności (ETS)"),
+        alpha = 0.25
+      ) +
+      geom_line(
+        data = df_fc,
+        aes(x = year, y = mean, colour = "Prognoza ETS", linetype = "Prognoza ETS"),
+        linewidth = 1.0
+      )
+  }
+
+  if (!is.null(df_arimax)) {
+    gg <- gg +
+      geom_line(
+        data = df_arimax,
+        aes(x = year, y = mean, colour = "ARIMAX (impuls 2020)", linetype = "ARIMAX (impuls 2020)"),
+        linewidth = 0.95
+      )
+  }
+
+  if (isTRUE(y_auto)) {
+    y_all <- c(df_obs$ln_value, df_model$ln_value)
+    if (!is.null(df_fc)) y_all <- c(y_all, df_fc$lo, df_fc$hi, df_fc$mean)
+    if (!is.null(df_arimax)) y_all <- c(y_all, df_arimax$mean)
+
+    y_min <- min(y_all, na.rm = TRUE)
+    y_max <- max(y_all, na.rm = TRUE)
+    pad <- y_pad * (y_max - y_min)
+    gg <- gg + coord_cartesian(ylim = c(y_min - pad, y_max + pad))
+  } else if (!is.null(y_lim)) {
+    gg <- gg + coord_cartesian(ylim = y_lim)
+  }
+
+  gg +
+    labs(
+      title = paste0("Prognoza: ", var_label, " (liczba, log) - ", label_country(bundle$country)),
+      subtitle = paste0(
+        "Skala logarytmiczna; ETS (główna), porównanie: ARIMAX (impuls 2020)"
+      ),
+      x = "Rok",
+      y = "Logarytm naturalny wartości"
+    ) +
+    scale_color_manual(
+      name = "Serie",
+      values = c(
+        "Dane (fragment estymacji)" = kolor_granat,
+        "Prognoza ETS" = kolor_blekit,
+        "ARIMAX (impuls 2020)" = kolor_granat
+      ),
+      breaks = c("Dane (fragment estymacji)", "Prognoza ETS", "ARIMAX (impuls 2020)")
+    ) +
+    scale_linetype_manual(
+      name = "Serie",
+      values = c(
+        "Dane (fragment estymacji)" = "solid",
+        "Prognoza ETS" = "solid",
+        "ARIMAX (impuls 2020)" = "dotdash"
+      ),
+      breaks = c("Dane (fragment estymacji)", "Prognoza ETS", "ARIMAX (impuls 2020)")
+    ) +
+    scale_fill_manual(
+      name = "Niepewność",
+      values = c("Przedział niepewności (ETS)" = kolor_blekit)
+    ) +
+    guides(
+      colour = guide_legend(order = 1, override.aes = list(alpha = 1)),
+      linetype = guide_legend(order = 1),
+      fill = guide_legend(order = 2)
+    ) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
+    theme_inz()
+}
+
+plot_country_forecast_bez_szoku <- function(bundle, level = 80, y_lim = NULL, y_auto = FALSE, y_pad = 0.06) {
+  s <- bundle$series
+  var_label <- label_var(bundle$value_col)
+  shock_year <- bundle$shock_year
+
+  df_obs <- s$df_obs %>% mutate(ln_value = log(value))
+  df_model <- s$df_model %>% mutate(ln_value = log(value))
+
+  fc_cf_ets   <- bundle$forecasts$noshock_ets
+  fc_cf_arima <- bundle$forecasts$noshock_arima
+
+  if (is.null(fc_cf_ets) && is.null(fc_cf_arima)) {
+    message("Brak wariantu 'bez szoku' dla: ", bundle$country, " (za krótki fragment < ", shock_year, " lub błąd dopasowania).")
+    return(NULL)
+  }
+
+  start_year_cf <- (max(s$years[s$years < shock_year]) + 1)
+
+  df_cf_ets <- NULL
+  if (!is.null(fc_cf_ets)) {
+    years_cf <- start_year_cf:(start_year_cf + length(fc_cf_ets$mean) - 1)
+    df_cf_ets <- tibble(
+      year = years_cf,
+      mean = as.numeric(fc_cf_ets$mean),
+      lo   = as.numeric(fc_cf_ets$lower[, 1]),
+      hi   = as.numeric(fc_cf_ets$upper[, 1])
+    )
+  }
+
+  df_cf_arima <- NULL
+  if (!is.null(fc_cf_arima)) {
+    years_cf <- start_year_cf:(start_year_cf + length(fc_cf_arima$mean) - 1)
+    df_cf_arima <- tibble(
+      year = years_cf,
+      mean = as.numeric(fc_cf_arima$mean)
+    )
+  }
+
+  gg <- ggplot() +
+    annotate("rect",
+             xmin = shock_year - 0.5, xmax = shock_year + 0.5,
+             ymin = -Inf, ymax = Inf,
+             fill = kolor_ryzyko, alpha = 0.18) +
+    geom_point(data = df_obs, aes(x = year, y = ln_value),
+               color = kolor_neutral, alpha = 0.35, size = 1.6) +
+    geom_line(
+      data = df_model,
+      aes(x = year, y = ln_value,
+          colour = "Dane (fragment estymacji)",
+          linetype = "Dane (fragment estymacji)"),
+      linewidth = 0.9
+    )
+
+  if (!is.null(df_cf_ets)) {
+    gg <- gg +
+      geom_ribbon(
+        data = df_cf_ets,
+        aes(x = year, ymin = lo, ymax = hi, fill = "Przedział niepewności (ETS, bez szoku)"),
+        alpha = 0.20
+      ) +
+      geom_line(
+        data = df_cf_ets,
+        aes(x = year, y = mean,
+            colour = "Bez szoku: ETS (< 2020)",
+            linetype = "Bez szoku: ETS (< 2020)"),
+        linewidth = 1.0
+      )
+  }
+
+  if (!is.null(df_cf_arima)) {
+    gg <- gg +
+      geom_line(
+        data = df_cf_arima,
+        aes(x = year, y = mean,
+            colour = "Bez szoku: ARIMA (< 2020)",
+            linetype = "Bez szoku: ARIMA (< 2020)"),
+        linewidth = 0.95
+      )
+  }
+
+  if (isTRUE(y_auto)) {
+    y_all <- c(df_obs$ln_value, df_model$ln_value)
+    if (!is.null(df_cf_ets)) y_all <- c(y_all, df_cf_ets$lo, df_cf_ets$hi, df_cf_ets$mean)
+    if (!is.null(df_cf_arima)) y_all <- c(y_all, df_cf_arima$mean)
+
+    y_min <- min(y_all, na.rm = TRUE)
+    y_max <- max(y_all, na.rm = TRUE)
+    pad <- y_pad * (y_max - y_min)
+    gg <- gg + coord_cartesian(ylim = c(y_min - pad, y_max + pad))
+  } else if (!is.null(y_lim)) {
+    gg <- gg + coord_cartesian(ylim = y_lim)
+  }
+
+  gg +
+    labs(
+      title = paste0("Wariant bez szoku: ", var_label, " (liczba, log) - ", label_country(bundle$country)),
+      subtitle = paste0(
+        "Skala logarytmiczna; ścieżki kontrfaktyczne na podstawie modeli trenowanych do ", shock_year - 1
+      ),
+      x = "Rok",
+      y = "Logarytm naturalny wartości"
+    ) +
+    scale_color_manual(
+      name = "Serie",
+      values = c(
+        "Dane (fragment estymacji)" = kolor_granat,
+        "Bez szoku: ETS (< 2020)" = kolor_blekit,
+        "Bez szoku: ARIMA (< 2020)" = kolor_neutral
+      ),
+      breaks = c("Dane (fragment estymacji)", "Bez szoku: ETS (< 2020)", "Bez szoku: ARIMA (< 2020)")
+    ) +
+    scale_linetype_manual(
+      name = "Serie",
+      values = c(
+        "Dane (fragment estymacji)" = "solid",
+        "Bez szoku: ETS (< 2020)" = "dashed",
+        "Bez szoku: ARIMA (< 2020)" = "dotted"
+      ),
+      breaks = c("Dane (fragment estymacji)", "Bez szoku: ETS (< 2020)", "Bez szoku: ARIMA (< 2020)")
+    ) +
+    scale_fill_manual(
+      name = "Niepewność",
+      values = c("Przedział niepewności (ETS, bez szoku)" = kolor_blekit)
+    ) +
+    guides(
+      colour = guide_legend(order = 1, override.aes = list(alpha = 1)),
+      linetype = guide_legend(order = 1),
+      fill = guide_legend(order = 2)
+    ) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
+    theme_inz()
+}
+```
+
+### Prognozy dla wybranych krajów
+```{r}
+example_countries <- c("Spain", "France", "United States", "Poland")
+
+safe_bundle <- purrr::safely(function(country) {
+  forecast_country_bundle(country, value_col = "tourism_arrivals", h = 5, level = 80, shock_year = 2020)
+})
+
+tmp <- map(example_countries, safe_bundle)
+
+err_idx <- map_lgl(tmp, ~ !is.null(.x$error))
+if (any(err_idx)) {
+  message("Błędy dla krajów: ", paste(example_countries[err_idx], collapse = ", "))
+  message("Pierwszy błąd: ", tmp[[which(err_idx)[1]]]$error$message)
+}
+
+bundles <- map(tmp, "result")
+names(bundles) <- example_countries
+
+plots_main <- imap(bundles, ~ {
+  if (is.null(.x)) return(NULL)
+
+  p <- plot_country_forecast_main(.x, level = 80, y_auto = TRUE)
+  if (is.null(p)) return(NULL)
+
+  save_plot(p, paste0("prognoza_przyjazdy_", make.names(.y), ".png"))
+  p
+}) %>% purrr::compact()
+
+plots_bez_szoku <- imap(bundles, ~ {
+  if (is.null(.x)) return(NULL)
+
+  p <- plot_country_forecast_bez_szoku(.x, level = 80, y_auto = TRUE)
+  if (is.null(p)) return(NULL)
+
+  save_plot(p, paste0("prognoza_przyjazdy_", make.names(.y), "_bez_szoku.png"))
+  p
+}) %>% purrr::compact()
+
+if (length(plots_main) > 0) purrr::walk(plots_main, print)
+if (length(plots_bez_szoku) > 0) purrr::walk(plots_bez_szoku, print)
+
+saved <- list.files("../outputs", pattern = "^prognoza_przyjazdy_.*\\.png$", full.names = FALSE)
+
+if (length(saved) > 0) {
+  tibble(Plik = saved) %>%
+    gt() %>%
+    tab_header(title = "Zapisane wykresy (kraj)") %>%
+    cols_label(Plik = "Plik .png") %>%
+    tab_options(table.font.size = px(12))
+} else {
+  message("Brak zapisanych wykresów w folderze outputs.")
+}
+
+```
+
+```{r}
+if (length(bundles[!map_lgl(bundles, is.null)]) > 0) {
+  b1 <- bundles[!map_lgl(bundles, is.null)][[1]]
+  tbl <- b1$metrics %>%
+    mutate(
+      Model = recode(Model,
+                     "ETS" = "ETS (wygładzanie wykładnicze)",
+                     "ARIMA (benchmark)" = "ARIMA (benchmark)",
+                     "ARIMAX (impuls 2020)" = "ARIMAX (impuls w 2020 r.)",
+                     "Wariant: bez szoku (ETS < 2020)" = "Wariant: bez szoku (ETS dla lat < 2020)",
+                     "Wariant: bez szoku (ARIMA < 2020)" = "Wariant: bez szoku (ARIMA dla lat < 2020)")
+    ) %>%
+    gt() %>%
+    tab_header(title = md(paste0("Porównanie modeli - ", label_country(b1$country)))) %>%
+    fmt_number(columns = AICc, decimals = 2) %>%
+    tab_options(
+      heading.background.color = "#ffffff",
+      column_labels.background.color = "#f8f9fa",
+      column_labels.font.weight = "bold",
+      table.font.size = px(12),
+      data_row.padding = px(5)
+    )
+  tbl
+}
+```
+
+### Prognoza w grupach
+```{r}
+tourism_dep <- tourism_clean %>%
+  group_by(country) %>%
+  summarise(mean_exp = mean(tourism_exports, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dep_group = case_when(
+    is.na(mean_exp) ~ NA_character_,
+    mean_exp < 10 ~ "Niska",
+    mean_exp < 20 ~ "Średnia",
+    TRUE ~ "Wysoka"
+  ))
+
+tourism_grp <- tourism_clean %>%
+  left_join(tourism_dep %>% select(country, dep_group), by = "country") %>%
+  filter(!is.na(dep_group))
+```
+
+```{r}
+build_group_series <- function(df, dep_group_name,
+                               value_col = "tourism_arrivals",
+                               min_len = 10,
+                               min_countries_year = 10) {
+
+  d_year <- df %>%
+    filter(dep_group == dep_group_name) %>%
+    select(country, year, value = all_of(value_col)) %>%
+    filter(!is.na(value), value > 0) %>%
+    mutate(ln_value = log(value)) %>%
+    group_by(year) %>%
+    summarise(
+      ln_med = median(ln_value, na.rm = TRUE),
+      n_krajow = n_distinct(country),
+      .groups = "drop"
+    ) %>%
+    filter(n_krajow >= min_countries_year) %>%
+    arrange(year)
+
+  if (nrow(d_year) < min_len) return(NULL)
+
+  
+  d_run <- d_year %>%
+    mutate(gap = c(TRUE, diff(year) != 1),
+           grp = cumsum(gap))
+
+  run_stats <- d_run %>%
+    group_by(grp) %>%
+    summarise(n = n(), start = min(year), end = max(year), .groups = "drop") %>%
+    arrange(desc(end), desc(n))
+
+  run_ok <- run_stats %>% filter(n >= min_len)
+  if (nrow(run_ok) == 0) return(NULL)
+
+  grp_best <- run_ok$grp[1]
+
+  d_model <- d_run %>%
+    filter(grp == grp_best) %>%
+    select(year, ln_med, n_krajow)
+
+  y_ts <- ts(d_model$ln_med, start = min(d_model$year), frequency = 1)
+
+  list(
+    df_year = d_year,
+    df_model = d_model,
+    years = d_model$year,
+    y_ts = y_ts,
+    end_year = max(d_model$year, na.rm = TRUE)
+  )
+}
+```
+
+```{r}
+forecast_group_bundle <- function(dep_group_name, value_col = "tourism_arrivals",
+                                  h = 5, level = 80, shock_year = 2020,
+                                  min_len = 10, min_countries_year = 10) {
+
+  s <- build_group_series(
+    tourism_grp,
+    dep_group_name = dep_group_name,
+    value_col = value_col,
+    min_len = min_len,
+    min_countries_year = min_countries_year
+  )
+  if (is.null(s)) return(NULL)
+
+  b <- fit_forecast_bundle(s$y_ts, s$years, h = h, level = level, shock_year = shock_year)
+  b$series <- s
+  b$value_col <- value_col
+  b$group <- dep_group_name
+  b$shock_year <- shock_year
+  b
+}
+```
+
+```{r}
+plot_group_forecast_main <- function(bundle, level = 80, y_lim = NULL, y_auto = FALSE, y_pad = 0.06) {
+  s <- bundle$series
+  var_label <- label_var(bundle$value_col)
+  shock_year <- bundle$shock_year
+  end_year <- s$end_year
+
+  df_obs <- s$df_year %>% transmute(year, ln_value = ln_med)
+  df_model <- s$df_model %>% transmute(year, ln_value = ln_med)
+
+  fc_ets   <- bundle$forecasts$ets
+  fc_arimax <- bundle$forecasts$arimax
+
+  df_fc <- NULL
+  if (!is.null(fc_ets)) {
+    df_fc <- tibble(
+      year = (end_year + 1):(end_year + length(fc_ets$mean)),
+      mean = as.numeric(fc_ets$mean),
+      lo   = as.numeric(fc_ets$lower[, 1]),
+      hi   = as.numeric(fc_ets$upper[, 1])
+    )
+  }
+
+  df_arimax <- NULL
+  if (!is.null(fc_arimax)) {
+    df_arimax <- tibble(
+      year = (end_year + 1):(end_year + length(fc_arimax$mean)),
+      mean = as.numeric(fc_arimax$mean)
+    )
+  }
+
+  gg <- ggplot() +
+    annotate("rect",
+             xmin = shock_year - 0.5, xmax = shock_year + 0.5,
+             ymin = -Inf, ymax = Inf,
+             fill = kolor_ryzyko, alpha = 0.18) +
+    geom_line(
+      data = df_model,
+      aes(x = year, y = ln_value,
+          colour = "Dane (mediana w grupie)",
+          linetype = "Dane (mediana w grupie)"),
+      linewidth = 1.0
+    )
+
+  if (!is.null(df_fc)) {
+    gg <- gg +
+      geom_ribbon(
+        data = df_fc,
+        aes(x = year, ymin = lo, ymax = hi, fill = "Przedział niepewności (ETS)"),
+        alpha = 0.25
+      ) +
+      geom_line(
+        data = df_fc,
+        aes(x = year, y = mean, colour = "Prognoza ETS", linetype = "Prognoza ETS"),
+        linewidth = 1.0
+      )
+  }
+
+  if (!is.null(df_arimax)) {
+    gg <- gg +
+      geom_line(
+        data = df_arimax,
+        aes(x = year, y = mean, colour = "ARIMAX (impuls 2020)", linetype = "ARIMAX (impuls 2020)"),
+        linewidth = 0.95
+      )
+  }
+
+  if (isTRUE(y_auto)) {
+    y_all <- c(df_obs$ln_value, df_model$ln_value)
+    if (!is.null(df_fc)) y_all <- c(y_all, df_fc$lo, df_fc$hi, df_fc$mean)
+    if (!is.null(df_arimax)) y_all <- c(y_all, df_arimax$mean)
+
+    y_min <- min(y_all, na.rm = TRUE)
+    y_max <- max(y_all, na.rm = TRUE)
+    pad <- y_pad * (y_max - y_min)
+    gg <- gg + coord_cartesian(ylim = c(y_min - pad, y_max + pad))
+  } else if (!is.null(y_lim)) {
+    gg <- gg + coord_cartesian(ylim = y_lim)
+  }
+
+  gg +
+    labs(
+      title = paste0("Prognoza: ", var_label, " (liczba, log) - grupa: ", bundle$group),
+      subtitle = "Skala logarytmiczna; ETS (główna), porównanie: ARIMAX (impuls 2020)",
+      x = "Rok",
+      y = "Logarytm naturalny wartości"
+    ) +
+    scale_color_manual(
+      name = "Serie",
+      values = c(
+        "Dane (mediana w grupie)" = kolor_granat,
+        "Prognoza ETS" = kolor_blekit,
+        "ARIMAX (impuls 2020)" = kolor_granat
+      ),
+      breaks = c("Dane (mediana w grupie)", "Prognoza ETS", "ARIMAX (impuls 2020)")
+    ) +
+    scale_linetype_manual(
+      name = "Serie",
+      values = c(
+        "Dane (mediana w grupie)" = "solid",
+        "Prognoza ETS" = "solid",
+        "ARIMAX (impuls 2020)" = "dotdash"
+      ),
+      breaks = c("Dane (mediana w grupie)", "Prognoza ETS", "ARIMAX (impuls 2020)")
+    ) +
+    scale_fill_manual(
+      name = "Niepewność",
+      values = c("Przedział niepewności (ETS)" = kolor_blekit)
+    ) +
+    guides(
+      colour = guide_legend(order = 1, override.aes = list(alpha = 1)),
+      linetype = guide_legend(order = 1),
+      fill = guide_legend(order = 2)
+    ) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
+    theme_inz()
+}
+
+plot_group_forecast_bez_szoku <- function(bundle, level = 80, y_lim = NULL, y_auto = FALSE, y_pad = 0.06) {
+  s <- bundle$series
+  var_label <- label_var(bundle$value_col)
+  shock_year <- bundle$shock_year
+
+  df_obs <- s$df_year %>% transmute(year, ln_value = ln_med)
+  df_model <- s$df_model %>% transmute(year, ln_value = ln_med)
+
+  fc_cf_ets   <- bundle$forecasts$noshock_ets
+  fc_cf_arima <- bundle$forecasts$noshock_arima
+
+  if (is.null(fc_cf_ets) && is.null(fc_cf_arima)) {
+    message("Brak wariantu 'bez szoku' dla grupy: ", bundle$group, " (za krótki fragment < ", shock_year, " lub błąd dopasowania).")
+    return(NULL)
+  }
+
+  start_year_cf <- (max(s$years[s$years < shock_year]) + 1)
+
+  df_cf_ets <- NULL
+  if (!is.null(fc_cf_ets)) {
+    years_cf <- start_year_cf:(start_year_cf + length(fc_cf_ets$mean) - 1)
+    df_cf_ets <- tibble(
+      year = years_cf,
+      mean = as.numeric(fc_cf_ets$mean),
+      lo   = as.numeric(fc_cf_ets$lower[, 1]),
+      hi   = as.numeric(fc_cf_ets$upper[, 1])
+    )
+  }
+
+  df_cf_arima <- NULL
+  if (!is.null(fc_cf_arima)) {
+    years_cf <- start_year_cf:(start_year_cf + length(fc_cf_arima$mean) - 1)
+    df_cf_arima <- tibble(
+      year = years_cf,
+      mean = as.numeric(fc_cf_arima$mean)
+    )
+  }
+
+  gg <- ggplot() +
+    annotate("rect",
+             xmin = shock_year - 0.5, xmax = shock_year + 0.5,
+             ymin = -Inf, ymax = Inf,
+             fill = kolor_ryzyko, alpha = 0.18) +
+    geom_line(
+      data = df_model,
+      aes(x = year, y = ln_value,
+          colour = "Dane (mediana w grupie)",
+          linetype = "Dane (mediana w grupie)"),
+      linewidth = 1.0
+    )
+
+  if (!is.null(df_cf_ets)) {
+    gg <- gg +
+      geom_ribbon(
+        data = df_cf_ets,
+        aes(x = year, ymin = lo, ymax = hi, fill = "Przedział niepewności (ETS, bez szoku)"),
+        alpha = 0.20
+      ) +
+      geom_line(
+        data = df_cf_ets,
+        aes(x = year, y = mean,
+            colour = "Bez szoku: ETS (< 2020)",
+            linetype = "Bez szoku: ETS (< 2020)"),
+        linewidth = 1.0
+      )
+  }
+
+  if (!is.null(df_cf_arima)) {
+    gg <- gg +
+      geom_line(
+        data = df_cf_arima,
+        aes(x = year, y = mean,
+            colour = "Bez szoku: ARIMA (< 2020)",
+            linetype = "Bez szoku: ARIMA (< 2020)"),
+        linewidth = 0.95
+      )
+  }
+
+  if (isTRUE(y_auto)) {
+    y_all <- c(df_obs$ln_value, df_model$ln_value)
+    if (!is.null(df_cf_ets)) y_all <- c(y_all, df_cf_ets$lo, df_cf_ets$hi, df_cf_ets$mean)
+    if (!is.null(df_cf_arima)) y_all <- c(y_all, df_cf_arima$mean)
+
+    y_min <- min(y_all, na.rm = TRUE)
+    y_max <- max(y_all, na.rm = TRUE)
+    pad <- y_pad * (y_max - y_min)
+    gg <- gg + coord_cartesian(ylim = c(y_min - pad, y_max + pad))
+  } else if (!is.null(y_lim)) {
+    gg <- gg + coord_cartesian(ylim = y_lim)
+  }
+
+  gg +
+    labs(
+      title = paste0("Wariant bez szoku: ", var_label, " (liczba, log) - grupa: ", bundle$group),
+      subtitle = paste0("Skala logarytmiczna; ścieżki kontrfaktyczne (modele trenowane do ", shock_year - 1, ")"),
+      x = "Rok",
+      y = "Logarytm naturalny wartości"
+    ) +
+    scale_color_manual(
+      name = "Serie",
+      values = c(
+        "Dane (mediana w grupie)" = kolor_granat,
+        "Bez szoku: ETS (< 2020)" = kolor_blekit,
+        "Bez szoku: ARIMA (< 2020)" = kolor_neutral
+      ),
+      breaks = c("Dane (mediana w grupie)", "Bez szoku: ETS (< 2020)", "Bez szoku: ARIMA (< 2020)")
+    ) +
+    scale_linetype_manual(
+      name = "Serie",
+      values = c(
+        "Dane (mediana w grupie)" = "solid",
+        "Bez szoku: ETS (< 2020)" = "dashed",
+        "Bez szoku: ARIMA (< 2020)" = "dotted"
+      ),
+      breaks = c("Dane (mediana w grupie)", "Bez szoku: ETS (< 2020)", "Bez szoku: ARIMA (< 2020)")
+    ) +
+    scale_fill_manual(
+      name = "Niepewność",
+      values = c("Przedział niepewności (ETS, bez szoku)" = kolor_blekit)
+    ) +
+    guides(
+      colour = guide_legend(order = 1, override.aes = list(alpha = 1)),
+      linetype = guide_legend(order = 1),
+      fill = guide_legend(order = 2)
+    ) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
+    theme_inz()
+}
+```
+
+```{r}
+group_levels <- c("Niska", "Średnia", "Wysoka")
+
+group_bundles <- setNames(
+  map(group_levels, ~ forecast_group_bundle(.x, value_col = "tourism_arrivals", h = 5, level = 80, shock_year = 2020,
+                                            min_len = 10, min_countries_year = 10)),
+  group_levels
+)
+
+group_plots_main <- imap(group_bundles, ~ {
+  if (is.null(.x)) return(NULL)
+
+  p <- plot_group_forecast_main(.x, level = 80, y_auto = TRUE)
+  if (is.null(p)) return(NULL)
+
+  save_plot(p, paste0("prognoza_grupa_przyjazdy_", make.names(.y), ".png"))
+  p
+}) %>% purrr::compact()
+
+group_plots_bez_szoku <- imap(group_bundles, ~ {
+  if (is.null(.x)) return(NULL)
+
+  p <- plot_group_forecast_bez_szoku(.x, level = 80, y_auto = TRUE)
+  if (is.null(p)) return(NULL)
+
+  save_plot(p, paste0("prognoza_grupa_przyjazdy_", make.names(.y), "_bez_szoku.png"))
+  p
+}) %>% purrr::compact()
+
+if (length(group_plots_main) > 0) purrr::walk(group_plots_main, print)
+if (length(group_plots_bez_szoku) > 0) purrr::walk(group_plots_bez_szoku, print)
+
+saved <- list.files("../outputs", pattern = "^prognoza_grupa_przyjazdy_.*\\.png$", full.names = FALSE)
+
+if (length(saved) > 0) {
+  tibble(Plik = saved) %>%
+    gt() %>%
+    tab_header(title = "Zapisane wykresy (grupy)") %>%
+    cols_label(Plik = "Plik .png") %>%
+    tab_options(table.font.size = px(12))
+} else {
+  message("Brak zapisanych wykresów w folderze outputs.")
+}
+
+```

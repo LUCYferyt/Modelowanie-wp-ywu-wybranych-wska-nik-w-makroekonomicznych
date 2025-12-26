@@ -1,0 +1,326 @@
+---
+title: "Czyszczenie i optymalizacja zbioru danych"
+author: "Łucja Wuls"
+date: "2025-11-02"
+---
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(zoo)
+library(gt)       
+library(scales)
+library(countrycode)
+```
+
+```{r}
+var_pl <- c(
+  gdp = "PKB (USD)",
+  inflation = "Inflacja (CPI, %)",
+  unemployment = "Stopa bezrobocia (%)",
+  tourism_arrivals = "Przyjazdy turystów (liczba)",
+  tourism_receipts = "Wpływy z turystyki (USD)",
+  tourism_expenditures = "Wydatki turystyczne (USD)",
+  tourism_exports = "Eksport usług turystycznych (USD)",
+  tourism_departures = "Wyjazdy turystów (liczba)"
+)
+
+label_var <- function(x) dplyr::recode(x, !!!var_pl, .default = x)
+
+```
+
+### Wstęp i przygotowanie danych
+
+Celem notebooka jest przygotowanie czystego zbioru danych do analizy korelacji makroekonomicznych.
+
+```{r}
+raw_path <- "raw/world_tourism_economy_data.csv"
+tourism_raw <- read_csv(raw_path)
+
+
+tourism_clean <- tourism_raw %>%
+  clean_names() %>%
+  mutate(.iso_name = countrycode(country_code, origin = "iso3c", destination = "country.name"))
+
+
+agg_units <- tourism_clean %>%
+  filter(is.na(.iso_name) & country_code != "XKX") %>%   #kosowo
+  distinct(country, country_code) %>%
+  arrange(country)
+
+print(paste("Liczba jednostek agregujących do usunięcia:", nrow(agg_units)))
+print(agg_units)
+
+tourism_clean <- tourism_clean %>%
+  filter(!is.na(.iso_name) | country_code == "XKX") %>%
+  select(-.iso_name)
+
+
+dups <- tourism_clean %>%
+  count(country, year) %>%
+  filter(n > 1)
+print(paste("Liczba duplikatów:", nrow(dups)))
+
+```
+
+```{r}
+measure_vars <- c("tourism_receipts", "tourism_arrivals", "tourism_exports", 
+                  "tourism_departures", "tourism_expenditures", "gdp", 
+                  "inflation", "unemployment")
+
+tourism_clean <- tourism_clean %>%
+  mutate(all_measures_na = if_all(all_of(measure_vars), is.na))
+
+
+print(table(tourism_clean$all_measures_na))
+
+tourism_clean <- tourism_clean %>%
+  filter(!all_measures_na) %>%
+  select(-all_measures_na)
+```
+
+```{r}
+vars_to_interp <- c("tourism_receipts", "tourism_arrivals", "tourism_exports",
+                    "tourism_expenditures", "gdp", "inflation")
+
+shock_years <- c(2020, 2021)
+max_gap_years <- 2
+
+
+tourism_base <- tourism_clean %>%
+  arrange(country_code, year)
+
+
+tourism_old <- tourism_base %>%
+  group_by(country, country_code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(across(all_of(vars_to_interp),
+                ~ zoo::na.approx(., x = year, na.rm = FALSE))) %>%
+  ungroup()
+
+
+tourism_new <- tourism_base %>%
+  mutate(across(all_of(vars_to_interp), as.numeric)) %>%
+  group_by(country, country_code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    shock = year %in% shock_years,
+    block = cumsum(lag(shock, default = FALSE)) + 1
+  ) %>%
+  group_by(country, country_code, block) %>%
+  mutate(
+    across(all_of(vars_to_interp), ~{
+      x <- as.numeric(.)
+      x_hidden <- ifelse(shock, NA_real_, x)
+
+      x_interp <- zoo::na.approx(
+        x_hidden, x = year, na.rm = FALSE, maxgap = max_gap_years
+      )
+
+      ifelse(!is.na(x), x, x_interp)
+    })
+  ) %>%
+  ungroup() %>%
+  select(-shock, -block)
+
+
+imputed_summary <- function(base, filled, label) {
+  base %>%
+    select(country, country_code, year, all_of(vars_to_interp)) %>%
+    pivot_longer(all_of(vars_to_interp), names_to = "var", values_to = "base") %>%
+    left_join(
+      filled %>%
+        select(country_code, year, all_of(vars_to_interp)) %>%
+        pivot_longer(all_of(vars_to_interp), names_to = "var", values_to = "filled"),
+      by = c("country_code", "year", "var")
+    ) %>%
+    mutate(imputed = is.na(base) & !is.na(filled),
+           method = label)
+}
+
+imp_old <- imputed_summary(tourism_base, tourism_old, "old_na_approx")
+imp_new <- imputed_summary(tourism_base, tourism_new, "new_no_shock")
+
+bind_rows(imp_old, imp_new) %>%
+  mutate(is_shock = year %in% shock_years) %>%
+  group_by(method, var, is_shock) %>%
+  summarise(n_imputed = sum(imputed, na.rm = TRUE), .groups = "drop") %>%
+  arrange(var, is_shock, method) %>%
+  print(n = 200)
+
+
+smooth_index <- function(df, method_label) {
+  df %>%
+    filter(year >= 2018, year <= 2022) %>%
+    group_by(country_code) %>%
+    arrange(year, .by_group = TRUE) %>%
+    summarise(across(all_of(vars_to_interp), ~{
+      y <- log1p(as.numeric(.))
+      d2 <- diff(diff(y))
+      sum(abs(d2), na.rm = TRUE)
+    }), .groups = "drop") %>%
+    pivot_longer(all_of(vars_to_interp), names_to = "var", values_to = "smoothness") %>%
+    mutate(method = method_label)
+}
+
+s_old <- smooth_index(tourism_old, "old_na_approx")
+s_new <- smooth_index(tourism_new, "new_no_shock")
+
+bind_rows(s_old, s_new) %>%
+  group_by(method, var) %>%
+  summarise(mean_smooth = mean(smoothness, na.rm = TRUE),
+            median_smooth = median(smoothness, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(var, method) %>%
+  print(n = 200)
+
+
+countries_shock_imputed_old <- imp_old %>%
+  filter(imputed, year %in% shock_years, var %in% c("tourism_arrivals","tourism_receipts")) %>%
+  distinct(country_code, country) %>%
+  slice_head(n = 6)
+
+print(countries_shock_imputed_old)
+
+plot_compare <- function(cc, v) {
+  base <- tourism_base %>% filter(country_code == cc) %>% select(year, value = all_of(v)) %>% mutate(series = "base")
+  old  <- tourism_old  %>% filter(country_code == cc) %>% select(year, value = all_of(v)) %>% mutate(series = "old")
+  new  <- tourism_new  %>% filter(country_code == cc) %>% select(year, value = all_of(v)) %>% mutate(series = "new")
+
+  bind_rows(base, old, new) %>%
+    mutate(value = log1p(as.numeric(value))) %>%
+    ggplot(aes(year, value, linetype = series)) +
+    geom_line() +
+    geom_vline(xintercept = shock_years, alpha = 0.3) +
+    labs(title = paste0("Porównanie interpolacji: ", cc, " - ", v),
+         y = "log(1 + wartość)", x = "Rok")
+}
+
+
+if (nrow(countries_shock_imputed_old) > 0) {
+  cc1 <- countries_shock_imputed_old$country_code[1]
+  print(plot_compare(cc1, "tourism_receipts"))
+  print(plot_compare(cc1, "tourism_arrivals"))
+}
+
+```
+
+
+### Interpolacja danych
+
+Zastosowano interpolację liniową w celu uzupełnienia brakujących wartości w szeregach czasowych dla wybranych wskaźników.
+
+```{r}
+vars_to_interp <- c("tourism_receipts", "tourism_arrivals", "tourism_exports", 
+                    "tourism_expenditures", "gdp", "inflation")
+
+tourism_clean <- tourism_clean %>%
+  mutate(across(all_of(vars_to_interp), as.numeric)) %>% 
+  group_by(country, country_code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(across(all_of(vars_to_interp), 
+                ~ na.approx(., x = year, na.rm = FALSE))) %>%
+  ungroup()
+```
+
+###Analiza skuteczności czyszczenia danych.
+
+```{r}
+Sys.setenv(CHROMOTE_CHROME = "C:\\Users\\lucja\\AppData\\Local\\BraveSoftware\\Brave-Browser\\Application\\brave.exe")
+
+
+keys_after <- tourism_clean %>%
+  distinct(country_code, year)
+
+
+tourism_before_sample <- tourism_raw %>%
+  clean_names() %>%
+  semi_join(keys_after, by = c("country_code", "year"))
+
+
+measure_vars_use <- intersect(measure_vars, names(tourism_before_sample))
+measure_vars_use <- intersect(measure_vars_use, names(tourism_clean))
+
+# przed
+missing_before <- tourism_before_sample %>%
+  summarise(across(all_of(measure_vars_use), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "before")
+
+# po
+missing_after <- tourism_clean %>%
+  summarise(across(all_of(measure_vars_use), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "after")
+
+comparison_data <- missing_before %>%
+  left_join(missing_after, by = "variable") %>%
+  mutate(
+    variable = label_var(variable),
+    before = round(before, 1),
+    after  = round(after, 1)
+  ) %>%
+  arrange(after, before)
+
+
+tabela_wynikowa <- comparison_data %>%
+  gt() %>%
+  tab_header(
+    title = md("**Skuteczność procesu czyszczenia danych**"),
+    subtitle = "Udział braków (NA) przed i po interpolacji [%]"
+  ) %>%
+  cols_label(
+    variable = "Wskaźnik",
+    before = "Przed interpolacją (%)",
+    after = "Po interpolacji (%)"
+  ) %>%
+  fmt_number(columns = c(before, after), decimals = 1) %>%
+  data_color(
+    columns = after,
+    fn = scales::col_numeric(
+      palette = c("#E8F5E9", "#FFEBEE"),
+      domain = c(0, 100)
+    )
+  )
+
+tabela_wynikowa
+gtsave(tabela_wynikowa, "../outputs/tabela_czyszczenie.png")
+
+```
+
+
+###Wizualizacja redukcji braków (Lollipop Chart)
+
+```{r}
+ggplot(comparison_data) +
+  geom_segment(aes(x = reorder(variable, before), xend = variable, 
+                   y = before, yend = after), color = "grey70", size = 1.2) +
+  geom_point(aes(x = variable, y = before), color = "#E57373", size = 4, alpha = 0.8) +
+  geom_point(aes(x = variable, y = after), color = "#81C784", size = 4) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::label_percent(scale = 1, suffix = "%")) +
+  labs(
+    title = "Redukcja braków danych po zastosowaniu interpolacji",
+    subtitle = "Czerwone punkty: stan surowy | Zielone punkty: po czyszczeniu",
+    x = NULL, y = "Udział brakujących obserwacji"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(face = "italic")
+  )
+
+
+ggsave("../outputs/wykres_braki_lollipop.png", width = 8, height = 5, dpi = 300)
+```
+
+
+```{r}
+summary(tourism_clean %>% select(all_of(measure_vars)))
+
+
+clean_path <- "clean/world_tourism_economy_data_clean.csv"
+dir.create(dirname(clean_path), recursive = TRUE, showWarnings = FALSE)
+write_csv(tourism_clean, clean_path)
+
+print(paste("Plik zapisany w:", clean_path))
+```

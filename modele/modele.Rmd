@@ -1,0 +1,1159 @@
+---
+title: "Specyfikacja i estymacja modeli ruchu turystycznego"
+author: "Łucja Wuls"
+date: "2025-12-09"
+---
+
+
+```{r}
+library(tidyverse)
+library(readr)
+library(janitor)
+library(plm)
+library(lmtest)
+library(sandwich)
+library(broom)
+library(forecast)
+library(gt)
+library(grid)
+```
+
+```{r}
+var_pl <- c(
+  gdp = "PKB (USD)",
+  inflation = "Inflacja (CPI, %)",
+  unemployment = "Stopa bezrobocia (%)",
+  tourism_arrivals = "Przyjazdy turystów (liczba)",
+  tourism_receipts = "Wpływy z turystyki (USD)",
+  tourism_expenditures = "Wydatki turystyczne (USD)",
+  tourism_exports = "Eksport usług turystycznych (USD)",
+  tourism_departures = "Wyjazdy turystów (liczba)"
+)
+
+label_var <- function(x) dplyr::recode(x, !!!var_pl, .default = x)
+
+
+polish_term <- function(term) {
+  if (is.na(term)) return(term)
+  if (term == "(Intercept)") return("Wyraz wolny")
+
+  if (grepl("^lag\\(", term)) {
+    inside <- sub("^lag\\((.*)\\)$", "\\1", term)
+    parts <- strsplit(inside, ",")[[1]]
+    v <- trimws(parts[1])
+    k <- trimws(parts[2])
+    v_lab <- polish_term(v)
+    return(paste0("Opóźniona zmienna: ", v_lab, " (t-", k, ")"))
+  }
+
+  if (grepl("^lag_d_", term)) {
+    base <- sub("^lag_d_", "", term)
+    return(paste0("Opóźniona zmiana: ", polish_term(base), " (t-1)"))
+  }
+
+  if (grepl("^d_ln_", term)) {
+    base <- sub("^d_ln_", "", term)
+    base_lab <- label_var(base)
+    return(paste0("Zmiana ", base_lab, " (log)"))
+  }
+  if (grepl("^d_", term)) {
+    base <- sub("^d_", "", term)
+    base_lab <- label_var(base)
+    return(paste0("Zmiana ", base_lab))
+  }
+
+  if (grepl("^ln_", term)) {
+    base <- sub("^ln_", "", term)
+    base_lab <- label_var(base)
+    return(paste0(base_lab, " (log)"))
+  }
+
+  return(label_var(term))
+}
+
+polonizuj_tabele <- function(df) {
+  df2 <- df
+
+  if ("term" %in% names(df2)) {
+    df2 <- df2 %>%
+      mutate(Zmienna = vapply(term, polish_term, character(1))) %>%
+      select(-term) %>%
+      select(Zmienna, everything())
+  }
+
+  df2 <- df2 %>%
+    rename_with(~ gsub("^estimate$", "Współczynnik", .x)) %>%
+    rename_with(~ gsub("^std\\.error$", "Błąd standardowy", .x)) %>%
+    rename_with(~ gsub("^statistic$", "Statystyka", .x)) %>%
+    rename_with(~ gsub("^p\\.value$", "Wartość p", .x)) %>%
+    rename_with(~ gsub("^Estimate$", "Współczynnik", .x)) %>%
+    rename_with(~ gsub("^Std\\. Error$", "Błąd standardowy", .x)) %>%
+    rename_with(~ gsub("^t-value$", "Statystyka t", .x)) %>%
+    rename_with(~ gsub("^z-value$", "Statystyka z", .x)) %>%
+    rename_with(~ gsub("^Pr\\(>\\|t\\|\\)$", "Wartość p", .x)) %>%
+    rename_with(~ gsub("^Pr\\(>\\|z\\|\\)$", "Wartość p", .x))
+
+  df2
+}
+var_scale <- c(
+  gdp = 1e9,
+  tourism_receipts = 1e9,
+  tourism_arrivals = 1e6,
+  tourism_departures = 1e6,
+  inflation = 1,
+  unemployment = 1,
+  tourism_expenditures = 1,
+  tourism_exports = 1
+)
+```
+
+```{r}
+kolor_blekit <- "#7ea1ed"  
+kolor_granat <- "#3f51b5"  
+kolor_ryzyko <- "#d88a8a" 
+kolor_neutral <- "#546e7a"
+
+theme_inz <- function() {
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, color = "#2c3e50"),
+      plot.subtitle = element_text(size = 10, color = "#546e7a", margin = margin(b = 15)),
+      strip.background = element_rect(fill = "#f8f9fa", color = NA),
+      strip.text = element_text(face = "bold", size = 10, color = "#34495e"),
+      panel.grid.major = element_line(color = "#f0f0f0"),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(size = 9, face = "italic"),
+      axis.text = element_text(color = "#626d6e")
+    )
+}
+```
+
+
+
+```{r}
+Sys.setenv(CHROMOTE_CHROME = "C:\\Users\\lucja\\AppData\\Local\\BraveSoftware\\Brave-Browser\\Application\\brave.exe")
+
+dir.create("../outputs", showWarnings = FALSE)
+
+save_table_png <- function(df, filename, title = "Wyniki modelu") {
+  df <- polonizuj_tabele(df)
+
+  filepath_csv <- file.path("../outputs", filename)
+  readr::write_csv(df, file = filepath_csv)
+  
+  img_name <- sub("\\.csv$", ".png", filename)
+  filepath_png <- file.path("../outputs", img_name)
+  
+  gt_tbl <- df %>%
+    gt() %>%
+    tab_header(title = md(paste0("**", title, "**"))) %>%
+    tab_options(
+      heading.background.color = "#ffffff",
+      column_labels.background.color = "#f8f9fa",
+      column_labels.font.weight = "bold",
+      table.font.size = px(12),
+      data_row.padding = px(5)
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_column_labels()
+    ) %>%
+    fmt_number(
+      columns = where(is.numeric),
+      decimals = 4
+    )
+
+  gtsave(gt_tbl, filepath_png)
+}
+```
+
+
+```{r}
+df_raw <- read_csv("../data/clean/world_tourism_economy_data_clean.csv") %>% clean_names()
+```
+
+
+```{r}
+tourism_panel <- df_raw %>%
+  group_by(country) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+  
+    ln_arrivals = if_else(tourism_arrivals > 0, log10(tourism_arrivals), NA_real_),
+    ln_receipts = if_else(tourism_receipts > 0, log10(tourism_receipts), NA_real_),
+    ln_gdp = if_else(gdp > 0, log10(gdp), NA_real_),
+    ln_tourism_exports = if_else(tourism_exports > 0, log10(tourism_exports), NA_real_),
+    ln_tourism_expenditures = if_else(tourism_expenditures > 0, log10(tourism_expenditures), NA_real_),
+    
+  
+    d_ln_arrivals = ln_arrivals - lag(ln_arrivals),
+    d_ln_receipts = ln_receipts - lag(ln_receipts),
+    d_ln_gdp = ln_gdp - lag(ln_gdp),
+    d_unemployment = unemployment - lag(unemployment),
+    d_inflation = inflation - lag(inflation),
+    d_ln_tourism_exports = ln_tourism_exports - lag(ln_tourism_exports),
+    d_ln_tourism_expenditures = ln_tourism_expenditures - lag(ln_tourism_expenditures),
+    
+    
+    lag_d_ln_arrivals = lag(d_ln_arrivals),
+    lag_d_ln_receipts = lag(d_ln_receipts)
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+pdata <- pdata.frame(as.data.frame(tourism_panel), index = c("country", "year"))
+```
+
+```{r}
+tourism_panel %>%
+  select(country, year,
+         ln_arrivals, ln_receipts,
+         ln_gdp, ln_tourism_exports, ln_tourism_expenditures) %>%
+  filter(!is.na(ln_arrivals) | !is.na(ln_receipts)) %>%
+  head()
+```
+
+
+
+```{r}
+
+form_arrivals_static <- ln_arrivals ~ ln_gdp + unemployment + inflation +
+  ln_tourism_exports + ln_tourism_expenditures
+
+form_receipts_static <- ln_receipts ~ ln_gdp + unemployment + inflation +
+  ln_tourism_exports + ln_tourism_expenditures
+
+ols_arrivals <- lm(form_arrivals_static, data = tourism_panel)
+ols_receipts <- lm(form_receipts_static, data = tourism_panel)
+
+ols_arrivals_tidy <- broom::tidy(ols_arrivals)
+ols_receipts_tidy <- broom::tidy(ols_receipts)
+
+save_table_png(
+  ols_arrivals_tidy, 
+  "wspolczynniki_przyjazdy.csv", 
+  title = "Współczynniki OLS: Liczba przyjazdów (ln_arrivals)"
+)
+
+save_table_png(
+  ols_receipts_tidy, 
+  "wspolczynniki_wplywy.csv", 
+  title = "Współczynniki OLS: Przychody z turystyki (ln_receipts)"
+)
+```
+
+```{r}
+#diagnostyka OLS
+
+
+if (!exists("ols_arrivals")) {
+  stop("Brak obiektu ols_arrivals. Uruchom chunk z estymacją OLS albo podmień nazwę modelu w tym miejscu.")
+}
+
+ols_arrivals_diag <- tibble::tibble(
+  .fitted = as.numeric(stats::fitted(ols_arrivals)),
+  .resid  = as.numeric(stats::residuals(ols_arrivals))
+)
+
+if (exists("ols_receipts")) {
+  ols_receipts_diag <- tibble::tibble(
+    .fitted = as.numeric(stats::fitted(ols_receipts)),
+    .resid  = as.numeric(stats::residuals(ols_receipts))
+  )
+}
+
+```
+
+```{r}
+p_ols_arrivals_resid <- ggplot(ols_arrivals_diag, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.5, color = kolor_granat) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  theme_inz() + 
+  labs(
+     title = "Reszty vs dopasowane wartości",
+    subtitle = "Model OLS: Przyjazdy turystów (log)",
+    x = "Wartości dopasowane", 
+    y = "Reszty"
+  )
+
+ggsave("../outputs/wykres_reszty_przyjazdy.png", p_ols_arrivals_resid, width = 8, height = 5)
+
+#QQ-plot
+p_ols_arrivals_qq <- ggplot(ols_arrivals_diag, aes(sample = .resid)) +
+  stat_qq(alpha = 0.5, color = kolor_granat) + 
+  stat_qq_line() +
+  theme_inz() +
+  labs(
+     title = "Wykres kwartylowy",
+    subtitle = "Model OLS: Przyjazdy turystów (log)",
+    x = "Kwantyle teoretyczne",
+    y = "Kwantyle empiryczne"
+  )
+
+ggsave("../outputs/qqplot_przyjazdy.png", p_ols_arrivals_qq, width = 8, height = 5)
+
+```
+
+```{r}
+ols_receipts_diag <- broom::augment(ols_receipts) %>%
+  as_tibble()
+
+p_ols_receipts_resid <- ggplot(ols_receipts_diag, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.5, color = kolor_blekit) + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  theme_inz() + 
+  labs(
+    title = "Reszty vs dopasowane wartości",
+    subtitle = "Model OLS: Wpływy z turystyki (log)",
+    x = "Wartości dopasowane",
+    y = "Reszty"
+  )
+
+ggsave("../outputs/wykres_reszty_wplywy.png", p_ols_receipts_resid, width = 7, height = 5, dpi = 300)
+
+
+p_ols_receipts_qq <- ggplot(ols_receipts_diag, aes(sample = .resid)) +
+  stat_qq(alpha = 0.5, color = kolor_blekit) + 
+  stat_qq_line() +
+  theme_inz() +
+  labs(
+    title = "Wykres kwartylowy",
+    subtitle = "Model OLS: Wpływy z turystyki (log)",
+    x = "Kwantyle teoretyczne",
+    y = "Kwantyle empiryczne"
+  )
+
+ggsave("../outputs/qqplot_wplywy.png", p_ols_receipts_qq, width = 7, height = 5, dpi = 300)
+```
+
+###FE i RE
+
+```{r}
+form_panel_static_arrivals <- ln_arrivals ~ ln_gdp + unemployment + inflation +
+  ln_tourism_exports + ln_tourism_expenditures
+
+form_panel_static_receipts <- ln_receipts ~ ln_gdp + unemployment + inflation +
+  ln_tourism_exports + ln_tourism_expenditures
+
+fe_arrivals <- plm(
+  form_panel_static_arrivals,
+  data   = pdata,
+  model  = "within",
+  effect = "twoways"
+)
+
+re_arrivals <- plm(
+  form_panel_static_arrivals,
+  data   = pdata,
+  model  = "random",
+  effect = "twoways"
+)
+
+fe_receipts <- plm(
+  form_panel_static_receipts,
+  data   = pdata,
+  model  = "within",
+  effect = "twoways"
+)
+
+re_receipts <- plm(
+  form_panel_static_receipts,
+  data   = pdata,
+  model  = "random",
+  effect = "twoways"
+)
+
+summary(fe_arrivals)
+summary(re_arrivals)
+summary(fe_receipts)
+summary(re_receipts)
+```
+
+###Test Hausmana
+
+```{r}
+fe_arrivals <- plm(form_arrivals_static, data = pdata, model = "within", effect = "twoways")
+re_arrivals <- plm(form_arrivals_static, data = pdata, model = "random", effect = "twoways")
+
+fe_receipts <- plm(form_receipts_static, data = pdata, model = "within", effect = "twoways")
+re_receipts <- plm(form_receipts_static, data = pdata, model = "random", effect = "twoways")
+
+hausman_arrivals <- phtest(fe_arrivals, re_arrivals)
+hausman_receipts <- phtest(fe_receipts, re_receipts)
+```
+
+
+```{r}
+robust_se <- function(model) { 
+  plm::vcovHC(model, type = "HC1", cluster = "group") 
+}
+
+
+fe_arrivals_robust <- lmtest::coeftest(fe_arrivals, vcov. = robust_se(fe_arrivals))
+fe_receipts_robust <- lmtest::coeftest(fe_receipts, vcov. = robust_se(fe_receipts))
+
+
+fe_all_tidy <- dplyr::bind_rows(
+  broom::tidy(fe_arrivals_robust) %>% mutate(model = "FE_arrivals"),
+  broom::tidy(fe_receipts_robust) %>% mutate(model = "FE_receipts")
+)
+
+
+save_table_png(
+  fe_all_tidy, 
+  "wspolczynniki_panelowe_odporne.csv", 
+  title = "Współczynniki modeli panelowych (FE) z odpornymi błędami standardowymi"
+)
+```
+
+
+```{r}
+res_fe_arrivals <- data.frame(
+  resid = as.numeric(residuals(fe_arrivals))
+)
+
+
+p_fe_arrivals_hist <- ggplot(res_fe_arrivals, aes(x = resid)) +
+  geom_histogram(bins = 30, fill = kolor_granat, color = "white") + 
+  theme_inz() + 
+  labs(
+    title = "Rozkład reszt – model FE (Przyjazdy turystów (log))",
+    subtitle = "Histogram wartości resztowych dla modelu efektów ustalonych",
+    x = "Reszty",
+    y = "Liczba obserwacji"
+  )
+
+
+p_fe_arrivals_hist
+
+ggsave("../outputs/histogram_reszt_przyjazdy_fe.png", p_fe_arrivals_hist, width = 8, height = 5)
+```
+
+###Dynamiczne modele panelowe
+
+
+```{r}
+
+sysgmm_arrivals <- plm::pgmm(
+  ln_arrivals ~
+    plm::lag(ln_arrivals, 1) +
+    ln_gdp + unemployment + inflation +
+    ln_tourism_exports + ln_tourism_expenditures |
+    plm::lag(ln_arrivals, 2:3),
+  data = pdata,
+  effect = "individual",
+  model = "twosteps",
+  transformation = "ld"
+)
+
+
+sysgmm_receipts <- plm::pgmm(
+  ln_receipts ~
+    plm::lag(ln_receipts, 1) +
+    ln_gdp + unemployment + inflation +
+    ln_tourism_exports + ln_tourism_expenditures |
+    plm::lag(ln_receipts, 2:3),
+  data = pdata,
+  effect = "individual",
+  model = "twosteps",
+  transformation = "ld"
+)
+
+
+```
+
+###Wyniki System-GMM - tabele współczynników
+
+```{r}
+tab_sysgmm_arrivals <- as.data.frame(summary(sysgmm_arrivals)$coefficients) %>%
+  rownames_to_column("term") %>%
+  mutate(
+    term = case_when(
+      grepl("^lag\\(ln_arrivals, 1\\)", term) ~ "Opóźnione przyjazdy turystów (t-1)",
+      grepl("^plm::lag\\(ln_arrivals, 1\\)", term) ~ "Opóźnione przyjazdy turystów (t-1)",
+      TRUE ~ term
+    )
+  ) %>%
+  rename(
+    Zmienna = term,
+    Wspolczynnik = Estimate,
+    `Blad standardowy` = `Std. Error`,
+    `Statystyka z` = `z-value`,
+    `Wartosc p` = `Pr(>|z|)`
+  )
+
+tab_sysgmm_receipts <- as.data.frame(summary(sysgmm_receipts)$coefficients) %>%
+  rownames_to_column("term") %>%
+  mutate(
+    term = case_when(
+      grepl("^lag\\(ln_receipts, 1\\)", term) ~ "Opóźnione wpływy z turystyki (t-1)",
+      grepl("^plm::lag\\(ln_receipts, 1\\)", term) ~ "Opóźnione wpływy z turystyki (t-1)",
+      TRUE ~ term
+    )
+  ) %>%
+  rename(
+    Zmienna = term,
+    Wspolczynnik = Estimate,
+    `Blad standardowy` = `Std. Error`,
+    `Statystyka z` = `z-value`,
+    `Wartosc p` = `Pr(>|z|)`
+  )
+
+save_table_png(
+  tab_sysgmm_arrivals,
+  filename = "tabela_sysgmm_przyjazdy.csv",
+  title = "Wyniki System-GMM: przyjazdy turystów (zmienna zależna: Przyjazdy turystów (log))"
+)
+
+save_table_png(
+  tab_sysgmm_receipts,
+  filename = "tabela_sysgmm_wplywy.csv",
+  title = "Wyniki System-GMM: wpływy z turystyki (zmienna zależna: Wpływy z turystyki (log))"
+)
+
+```
+
+###Diagnostyka System-GMM (AR(1), AR(2), instrumenty)
+
+```{r}
+diag_sysgmm <- function(model, label) {
+  ar1 <- plm::mtest(model, order = 1)
+  ar2 <- plm::mtest(model, order = 2)
+  sarg <- tryCatch(plm::sargan(model), error = function(e) NULL)
+
+  tibble(
+    Model = label,
+    Test = c("AR(1) Arellano-Bond", "AR(2) Arellano-Bond", "Test Sargana (instrumenty)"),
+    `Wartość p` = c(
+      ar1$p.value,
+      ar2$p.value,
+      if (!is.null(sarg)) sarg$p.value else NA_real_
+    )
+  )
+}
+
+diag_all <- bind_rows(
+  diag_sysgmm(sysgmm_arrivals, "System-GMM: przyjazdy"),
+  diag_sysgmm(sysgmm_receipts, "System-GMM: wpływy")
+)
+
+save_table_png(
+  diag_all,
+  filename = "tabela_sysgmm_diagnostyka.csv",
+  title = "Diagnostyka modeli System-GMM (AR(1), AR(2), test instrumentów)"
+)
+```
+
+###Dynamiczny model panelowy FE jako punkt odniesienia
+
+```{r}
+
+fe_dyn_arrivals <- plm::plm(
+  ln_arrivals ~ plm::lag(ln_arrivals, 1) + ln_gdp + unemployment + inflation +
+    ln_tourism_exports + ln_tourism_expenditures,
+  data = pdata,
+  model = "within",
+  effect = "individual"
+)
+
+fe_dyn_receipts <- plm::plm(
+  ln_receipts ~ plm::lag(ln_receipts, 1) + ln_gdp + unemployment + inflation +
+    ln_tourism_exports + ln_tourism_expenditures,
+  data = pdata,
+  model = "within",
+  effect = "individual"
+)
+
+tab_fe_dyn <- dplyr::bind_rows(
+  broom::tidy(fe_dyn_arrivals) %>%
+    mutate(
+      Zmienna_zalezna = "Przyjazdy turystów (log)",
+      term = sapply(term, polish_term)
+    ),
+  broom::tidy(fe_dyn_receipts) %>%
+    mutate(
+      Zmienna_zalezna = "Wpływy z turystyki (log)",
+      term = sapply(term, polish_term)
+    )
+) %>%
+  dplyr::transmute(
+    `Zmienna zależna` = Zmienna_zalezna,
+    Zmienna = term,
+    Współczynnik = estimate,
+    `Błąd standardowy` = std.error,
+    `Statystyka t/z` = statistic,
+    `Wartość p` = p.value
+  )
+
+save_table_png(
+  tab_fe_dyn,
+  filename = "tabela_fe_dynamiczna.csv",
+  title = "Dynamiczny model panelowy FE (punkt odniesienia, możliwy Nickell bias)"
+)
+```
+
+###Porównanie współczynników dla opóźnionej zmiennej zależnej: FE vs System-GMM
+
+```{r}
+get_coef <- function(model, term_pattern) {
+  co <- tryCatch(stats::coef(model), error = function(e) NULL)
+  if (is.null(co)) return(NA_real_)
+  nm <- names(co)
+  ix <- which(grepl(term_pattern, nm))
+  if (length(ix) == 0) return(NA_real_)
+  unname(co[ix[1]])
+}
+
+comp_lag <- tibble::tibble(
+  `Zmienna zależna` = c("Przyjazdy turystów (log)", "Wpływy z turystyki (log)"),
+  `FE: lag(y)` = c(
+    get_coef(fe_dyn_arrivals, "lag\\(ln_arrivals"),
+    get_coef(fe_dyn_receipts, "lag\\(ln_receipts")
+  ),
+  `System-GMM: lag(y)` = c(
+    get_coef(sysgmm_arrivals, "lag\\(ln_arrivals"),
+    get_coef(sysgmm_receipts, "lag\\(ln_receipts")
+  )
+)
+
+save_table_png(
+  comp_lag,
+  filename = "tabela_porownanie_lag_fe_vs_sysgmm.csv",
+  title = "Porównanie parametru dynamiki: FE vs System-GMM"
+)
+```
+
+###Rozszerzona diagnostyka System-GMM
+
+```{r}
+n_instruments_pgmm <- function(m) {
+  cand <- c("W", "W1", "W2", "Z", "Z1", "Z2")
+  for (nm in cand) {
+    obj <- m[[nm]]
+    if (is.null(obj)) next
+    if (is.matrix(obj) || is.data.frame(obj)) return(ncol(obj))
+    if (is.list(obj) && length(obj) > 0) {
+      if (is.matrix(obj[[1]]) || is.data.frame(obj[[1]])) return(ncol(obj[[1]]))
+    }
+  }
+  NA_integer_
+}
+
+get_diag_p <- function(sm, pattern) {
+  d <- tryCatch(sm$diagnostics, error = function(e) NULL)
+  if (is.null(d)) return(NA_real_)
+  if (!is.matrix(d)) d <- as.matrix(d)
+  rn <- rownames(d)
+  if (is.null(rn)) return(NA_real_)
+  i <- which(grepl(pattern, rn, ignore.case = TRUE))
+  if (length(i) == 0) return(NA_real_)
+  cn <- colnames(d)
+  j <- which(grepl("p", cn, ignore.case = TRUE))
+  if (length(j) == 0) return(NA_real_)
+  as.numeric(d[i[1], j[1]])
+}
+
+diag_sysgmm_ext <- function(model, label) {
+  sm <- summary(model)
+
+  ar1_p <- tryCatch(plm::mtest(model, order = 1)$p.value, error = function(e) NA_real_)
+  ar2_p <- tryCatch(plm::mtest(model, order = 2)$p.value, error = function(e) NA_real_)
+  sarg_p <- tryCatch(plm::sargan(model)$p.value, error = function(e) NA_real_)
+
+  hans_p <- get_diag_p(sm, "hansen")
+
+  tibble::tibble(
+    Model = label,
+    `AR(1) p` = ar1_p,
+    `AR(2) p` = ar2_p,
+    `Sargan p` = sarg_p,
+    `Hansen p` = hans_p,
+    `Liczba instrumentów` = n_instruments_pgmm(model)
+  )
+}
+
+diag_sysgmm_ext_all <- dplyr::bind_rows(
+  diag_sysgmm_ext(sysgmm_arrivals, "System-GMM: przyjazdy"),
+  diag_sysgmm_ext(sysgmm_receipts, "System-GMM: wpływy")
+)
+
+save_table_png(
+  diag_sysgmm_ext_all,
+  filename = "tabela_sysgmm_diagnostyka_rozszerzona.csv",
+  title = "Diagnostyka System-GMM: AR(1), AR(2), test instrumentów i liczba instrumentów"
+)
+```
+
+
+
+## Statyczne modele panelowe FE w grupach krajów
+
+```{r}
+tourism_panel <- tourism_panel %>%
+  group_by(year) %>%
+  mutate(
+    dep_group = ntile(ln_gdp, 3),
+    dep_group = factor(dep_group, levels = 1:3, labels = c("Niski PKB", "Sredni PKB", "Wysoki PKB"))
+  ) %>%
+  ungroup()
+```
+
+```{r}
+dep_levels <- tourism_panel %>%
+  filter(!is.na(dep_group)) %>%
+  distinct(dep_group) %>%
+  arrange(dep_group) %>%
+  pull(dep_group)
+
+fe_arrivals_by_group <- list()
+fe_receipts_by_group <- list()
+
+form_arrivals_static <- ln_arrivals ~ ln_gdp + unemployment + inflation +
+  ln_tourism_exports + ln_tourism_expenditures
+
+form_receipts_static <- ln_receipts ~ ln_gdp + unemployment + inflation +
+  ln_tourism_exports + ln_tourism_expenditures
+
+for (g in dep_levels) {
+  pdata_g <- pdata[tourism_panel$dep_group == g, ]
+
+  fe_arrivals_by_group[[g]] <- plm::plm(
+    form_arrivals_static,
+    data   = pdata_g,
+    model  = "within",
+    effect = "individual"
+  )
+
+  fe_receipts_by_group[[g]] <- plm::plm(
+    form_receipts_static,
+    data   = pdata_g,
+    model  = "within",
+    effect = "individual"
+  )
+}
+
+fe_arrivals_by_group_tidy <- purrr::imap_dfr(
+  fe_arrivals_by_group,
+  ~ broom::tidy(.x) %>%
+    mutate(
+      dep_group = .y,
+      dep_var   = "ln_arrivals",
+      model     = "FE_stat"
+    )
+)
+
+fe_receipts_by_group_tidy <- purrr::imap_dfr(
+  fe_receipts_by_group,
+  ~ broom::tidy(.x) %>%
+    mutate(
+      dep_group = .y,
+      dep_var   = "ln_receipts",
+      model     = "FE_stat"
+    )
+)
+
+fe_panel_groups_key <- dplyr::bind_rows(
+  fe_arrivals_by_group_tidy,
+  fe_receipts_by_group_tidy
+) %>%
+  filter(term %in% c(
+    "ln_gdp",
+    "unemployment",
+    "inflation",
+    "ln_tourism_exports",
+    "ln_tourism_expenditures"
+  )) %>%
+  select(dep_group, dep_var, term, estimate, std.error, statistic, p.value)
+
+save_table_png(
+  fe_panel_groups_key,
+  filename = "tabela_fe_grupy_kluczowe.csv",
+  title = "Modele FE w grupach krajów: wybrane współczynniki"
+)
+```
+
+## Dynamiczne modele panelowe w grupach krajów (System-GMM)
+
+```{r}
+df_all <- as.data.frame(pdata)
+
+groups_map <- df_all %>%
+  group_by(country) %>%
+  summarise(gdp_level = mean(ln_gdp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    dep_group = dplyr::case_when(
+      ntile(gdp_level, 3) == 1 ~ "Niskie PKB",
+      ntile(gdp_level, 3) == 2 ~ "Średnie PKB",
+      ntile(gdp_level, 3) == 3 ~ "Wysokie PKB",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(country, dep_group)
+
+df_all <- df_all %>% left_join(groups_map, by = "country")
+
+if (any(is.na(df_all$dep_group))) {
+  warning("Niektóre wiersze mają NA w dep_group (sprawdź country).")
+}
+
+idx_names <- names(attr(pdata, "index"))
+if (is.null(idx_names) || length(idx_names) != 2) {
+  stop("pdata musi być pdata.frame z 2-elementowym index (id, czas).")
+}
+pdata2 <- plm::pdata.frame(df_all, index = idx_names)
+
+dep_levels <- sort(unique(as.character(df_all$dep_group)))
+
+pgmm_empty <- tibble(
+  dep_group = character(0),
+  Zmienna_zalezna = character(0),
+  term = character(0),
+  Estimate = numeric(0),
+  `Std. Error` = numeric(0),
+  `z-value` = numeric(0),
+  `Pr(>|z|)` = numeric(0)
+)
+
+diag_tbl <- tibble(dep_group = character(0), dep_var = character(0),
+                   n_obs = integer(0), status = character(0), msg = character(0))
+
+tidy_pgmm_safe <- function(model, grp, dep_label_pl) {
+  if (is.null(model)) return(pgmm_empty)
+  sm <- tryCatch(summary(model), error = function(e) NULL)
+  if (is.null(sm) || is.null(sm$coefficients)) return(pgmm_empty)
+  cm <- sm$coefficients
+  if (!is.matrix(cm)) cm <- as.matrix(cm)
+  if (nrow(cm) == 0) return(pgmm_empty)
+
+  out <- tibble(
+    dep_group = as.character(grp),
+    Zmienna_zalezna = dep_label_pl,
+    term = rownames(cm),
+    Estimate = as.numeric(cm[, "Estimate"]),
+    `Std. Error` = as.numeric(cm[, "Std. Error"]),
+    `z-value` = as.numeric(cm[, "z-value"]),
+    `Pr(>|z|)` = as.numeric(cm[, "Pr(>|z|)"])
+  )
+  out$term <- gsub("\\s+", "", out$term)
+  out
+}
+
+run_pgmm_safe <- function(formula, data_g) {
+  tryCatch(
+    plm::pgmm(
+      formula = formula,
+      data = data_g,
+      effect = "individual",
+      model = "twosteps",
+      transformation = "ld"
+    ),
+    error = function(e) e
+  )
+}
+
+sysgmm_groups_coef <- pgmm_empty[0, ]
+
+for (g in dep_levels) {
+
+  df_g <- df_all %>% filter(dep_group == g)
+
+  if (nrow(df_g) < 50) {
+    diag_tbl <- bind_rows(diag_tbl, tibble(dep_group = g, dep_var = "both",
+                                          n_obs = nrow(df_g), status = "skip",
+                                          msg = "Za mało obserwacji w grupie"))
+    next
+  }
+
+  pdata_g <- plm::pdata.frame(df_g, index = idx_names)
+
+  f_arr <- ln_arrivals ~ lag(ln_arrivals, 1) + ln_gdp + unemployment + inflation +
+    ln_tourism_exports + ln_tourism_expenditures | lag(ln_arrivals, 2:3)
+
+  res_arr <- run_pgmm_safe(f_arr, pdata_g)
+
+  if (inherits(res_arr, "error")) {
+    diag_tbl <- bind_rows(diag_tbl, tibble(dep_group = g, dep_var = "arrivals",
+                                          n_obs = nrow(df_g), status = "error",
+                                          msg = conditionMessage(res_arr)))
+  } else {
+    diag_tbl <- bind_rows(diag_tbl, tibble(dep_group = g, dep_var = "arrivals",
+                                          n_obs = nrow(df_g), status = "ok", msg = ""))
+    sysgmm_groups_coef <- bind_rows(sysgmm_groups_coef,
+                                   tidy_pgmm_safe(res_arr, g, "Przyjazdy turystów (log)"))
+  }
+
+  f_rec <- ln_receipts ~ lag(ln_receipts, 1) + ln_gdp + unemployment + inflation +
+    ln_tourism_exports + ln_tourism_expenditures | lag(ln_receipts, 2:3)
+
+  res_rec <- run_pgmm_safe(f_rec, pdata_g)
+
+  if (inherits(res_rec, "error")) {
+    diag_tbl <- bind_rows(diag_tbl, tibble(dep_group = g, dep_var = "receipts",
+                                          n_obs = nrow(df_g), status = "error",
+                                          msg = conditionMessage(res_rec)))
+  } else {
+    diag_tbl <- bind_rows(diag_tbl, tibble(dep_group = g, dep_var = "receipts",
+                                          n_obs = nrow(df_g), status = "ok", msg = ""))
+    sysgmm_groups_coef <- bind_rows(sysgmm_groups_coef,
+                                   tidy_pgmm_safe(res_rec, g, "Wpływy z turystyki (log)"))
+  }
+}
+
+cat("Liczba wierszy w sysgmm_groups_coef:", nrow(sysgmm_groups_coef), "\n")
+print(diag_tbl %>% count(status))
+print(diag_tbl %>% filter(status != "ok") %>% select(dep_group, dep_var, n_obs, status, msg) %>% head(20))
+
+is_key_term <- function(t) {
+  t %in% c("ln_gdp","unemployment","inflation","ln_tourism_exports","ln_tourism_expenditures") |
+    grepl("^lag\\(ln_arrivals,1\\)", t) |
+    grepl("^lag\\(ln_receipts,1\\)", t)
+}
+
+sysgmm_groups_key <- sysgmm_groups_coef %>%
+  filter(is_key_term(term)) %>%
+  select(dep_group, Zmienna_zalezna, term, Estimate, `Std. Error`, `z-value`, `Pr(>|z|)`)
+
+if (nrow(sysgmm_groups_key) == 0) {
+  write_csv(diag_tbl, "../outputs/diag_sysgmm_grupy.csv")
+  stop("W grupach nadal brak wyników. Zapisano diagnozę do ../outputs/diag_sysgmm_grupy.csv")
+}
+
+sysgmm_groups_out <- sysgmm_groups_key %>%
+  mutate(Zmienna = vapply(term, polish_term, character(1))) %>%
+  transmute(
+    `Grupa krajów` = dep_group,
+    `Zmienna zależna` = Zmienna_zalezna,
+    Zmienna,
+    Współczynnik = Estimate,
+    `Błąd standardowy` = `Std. Error`,
+    `Statystyka z` = `z-value`,
+    `Wartość p` = `Pr(>|z|)`
+  )
+
+sysgmm_niskie <- sysgmm_groups_out %>%
+  dplyr::filter(`Grupa krajów` == "Niskie PKB")
+
+save_table_png(
+  sysgmm_niskie,
+  filename = "tabela_sysgmm_niskie_pkb.png",
+  title = "Modele System-GMM: wybrane współczynniki (Niskie PKB)"
+)
+
+
+sysgmm_srednie <- sysgmm_groups_out %>%
+  dplyr::filter(`Grupa krajów` == "Średnie PKB")
+
+save_table_png(
+  sysgmm_srednie,
+  filename = "tabela_sysgmm_srednie_pkb.png",
+  title = "Modele System-GMM: wybrane współczynniki (Średnie PKB)"
+)
+
+
+sysgmm_wysokie <- sysgmm_groups_out %>%
+  dplyr::filter(`Grupa krajów` == "Wysokie PKB")
+
+save_table_png(
+  sysgmm_wysokie,
+  filename = "tabela_sysgmm_wysokie_pkb.png",
+  title = "Modele System-GMM: wybrane współczynniki (Wysokie PKB)"
+)
+```
+
+
+
+# Modele szeregów czasowych dla wybranych krajów
+
+```{r}
+example_countries <- c("France", "Spain", "United States", "Poland")
+
+ts_models_arrivals <- list()
+
+for (ctry in example_countries) {
+  ts_data <- tourism_panel %>%
+    filter(country == ctry) %>%
+    arrange(year) %>%
+    filter(!is.na(ln_arrivals))
+
+  if (nrow(ts_data) < 5) next
+
+  arrivals_ts <- ts(
+    ts_data$ln_arrivals,
+    start     = min(ts_data$year),
+    frequency = 1
+  )
+
+  fit <- forecast::auto.arima(arrivals_ts)
+
+  ts_models_arrivals[[ctry]] <- fit
+
+  cat("Kraj:", ctry, "
+")
+  print(summary(fit))
+  cat("
+------------------------------
+")
+}
+```
+
+```{r}
+ts_data_es <- tourism_panel %>%
+  filter(country == "Spain") %>%
+  arrange(year) %>%
+  filter(!is.na(ln_arrivals), !is.na(ln_gdp))
+
+if (nrow(ts_data_es) >= 5) {
+  arrivals_ts_es <- ts(ts_data_es$ln_arrivals, start = min(ts_data_es$year), frequency = 1)
+  gdp_ts_es <- ts(ts_data_es$ln_gdp, start = min(ts_data_es$year), frequency = 1)
+  
+ 
+  fit_es_arimax <- forecast::auto.arima(arrivals_ts_es, xreg = gdp_ts_es)
+  
+
+  arimax_tidy <- broom::tidy(fit_es_arimax)
+  
+  save_table_png(
+    arimax_tidy, 
+    "arimax_coefficients_spain.csv", 
+    title = "Współczynniki modelu ARIMAX (Hiszpania)"
+  )
+  
+
+  fc_es_arimax <- forecast::forecast(fit_es_arimax, xreg = rep(tail(gdp_ts_es, 1), 5), h = 5)
+  
+  p_es_arimax <- forecast::autoplot(fc_es_arimax) + 
+    theme_inz() + 
+    labs(
+      title = "Prognoza ARIMAX: Liczba przyjazdów (ln_arrivals)",
+      subtitle = "Kraj: Hiszpania | Regresor zewnętrzny: ln_gdp",
+      x = "Rok",
+      y = "ln(arrivals)"
+    ) +
+    autolayer(fc_es_arimax, series = "Prognoza", PI = TRUE, color = kolor_blekit)
+
+
+  ggsave(
+    filename = "../outputs/prognoza_arimax_przyjazdy_hiszpania.png", p_es_arimax,width= 8, height  = 5)
+}
+```
+
+
+```{r}
+if (exists("fit_es_arimax")) {
+  future_gdp_es <- rep(tail(gdp_ts_es, 1), 5)
+
+ 
+  fc_es_arimax <- forecast::forecast(
+    fit_es_arimax,
+    xreg = future_gdp_es,
+    h    = 5
+  )
+
+  p_es_arimax <- forecast::autoplot(fc_es_arimax) +
+    theme_inz() + 
+    labs(
+      title = "Prognoza ARIMAX dla ln_arrivals – Hiszpania",
+      subtitle = "Regresor zewnętrzny: ln_gdp (PKB)",
+      x = "Rok",
+      y = "ln(przyjazdy)"
+    ) +
+    scale_color_manual(values = kolor_granat) +
+    theme(
+      panel.grid.major = element_line(color = "#f0f0f0"),
+      legend.position = "none"
+    )
+
+
+  print(p_es_arimax)
+
+
+  ggsave(filename = "../outputs/prognoza_arimax_przyjazdy_hiszpania.png", p_es_arimax, width    = 8, height   = 5)
+}
+```
+
+
+
+```{r}
+ols_fit_stats <- dplyr::bind_rows(
+  broom::glance(ols_arrivals) %>%
+    dplyr::mutate(dep_var = "ln_arrivals"),
+  broom::glance(ols_receipts) %>%
+    dplyr::mutate(dep_var = "ln_receipts")
+) %>%
+  dplyr::select(
+    dep_var,        #zmienna zależna
+    nobs,           #liczba obserwacji
+    r.squared,      #R-kwadrat
+    adj.r.squared,  #skorygowany R-kwadrat
+    sigma,          #błąd standardowy reszt (RSE)
+    AIC,            #kryterium Akaikego
+    BIC             #ryterium Bayesowskie
+  )
+
+
+print(ols_fit_stats)
+
+
+save_table_png(
+  ols_fit_stats, 
+  "statystyki_dopasowania_ols.csv", 
+  title = "Porównanie statystyk dopasowania modeli OLS"
+)
+```
+
+## Zbiorcza tabela wyników testu Hausmana
+
+```{r}
+hausman_summary <- tibble::tibble(
+  dep_var   = c("ln_arrivals", "ln_receipts"),
+  statistic = c(
+    as.numeric(hausman_arrivals$statistic),
+    as.numeric(hausman_receipts$statistic)
+  ),
+  p_value   = c(
+    hausman_arrivals$p.value,
+    hausman_receipts$p.value
+  )
+) %>%
+  dplyr::mutate(
+    decyzja = ifelse(p_value < 0.05, "Odrzuć H0 (Wybierz FE)", "Brak podstaw do odrzucenia H0 (Wybierz RE)")
+  )
+
+print(hausman_summary)
+
+
+save_table_png(
+  hausman_summary, 
+  "wyniki_testu_hausmana.csv", 
+  title = "Wyniki testu Hausmana (FE vs RE)"
+)
+```
+
+## Podsumowanie dopasowania modeli ARIMA dla wybranych krajów
+
+```{r}
+if (length(ts_models_arrivals) > 0) {
+  ts_fit_stats <- purrr::imap_dfr(
+    ts_models_arrivals,
+    ~ tibble::tibble(
+      country = .y,
+      aic     = AIC(.x),
+      bic     = BIC(.x),
+      loglik  = as.numeric(logLik(.x))
+    )
+  ) %>%
+
+    dplyr::arrange(aic)
+
+  print(ts_fit_stats)
+
+
+  save_table_png(
+    ts_fit_stats, 
+    "statystyki_dopasowania_arima.csv", 
+    title = "Statystyki dopasowania modeli ARIMA dla poszczególnych krajów"
+  )
+}
+```
