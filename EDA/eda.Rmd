@@ -130,40 +130,56 @@ mutate(
 
 statystyki_prezentacja <- statystyki_formatted %>%
   select(Wskaznik, N, Srednia, Odch_std, Min, Q1, Mediana, Q3, Max, Zmienna_kod) %>%
-    gt() %>%
-      tab_header(
-        title = "Statystyki opisowe kluczowych wskaźników",
-        subtitle = "Zestawienie zbiorcze po skalowaniu jednostek"
-) %>%
-cols_label(
-  Wskaznik = "Wskaźnik",
-  N = "N",
-  Srednia = "Średnia",
-  Odch_std = "Odch. std.",
-  Min = "Min",
-  Q1 = "Q1",
-  Mediana = "Mediana",
-  Q3 = "Q3",
-  Max = "Max",
-  Zmienna_kod = "Kod"
-) %>%
-fmt_number(
-  columns = -c(Wskaznik, Zmienna_kod, N),
-  decimals = 2,
-  sep_mark = " ",
-  dec_mark = ","
-) %>%
+  gt() %>%
+  tab_header(
+    title = md("**Statystyki opisowe kluczowych wskaźników**"),
+    subtitle = "Zestawienie zbiorcze po skalowaniu jednostek"
+  ) %>%
+  cols_label(
+    Wskaznik = "Wskaźnik",
+    N = "N",
+    Srednia = "Średnia",
+    Odch_std = "Odch. std.",
+    Min = "Min",
+    Q1 = "Q1",
+    Mediana = "Mediana",
+    Q3 = "Q3",
+    Max = "Max",
+    Zmienna_kod = "Kod"
+  ) %>%
+  fmt_number(
+    columns = -c(Wskaznik, Zmienna_kod, N),
+    decimals = 2,
+    dec_mark = ",",
+    sep_mark = " "
+  ) %>%
   tab_row_group(
     label = "Wskaźniki makroekonomiczne",
     rows = Zmienna_kod %in% c("gdp", "inflation", "unemployment")
-) %>%
+  ) %>%
   tab_row_group(
     label = "Ruch turystyczny i wydatki",
     rows = !Zmienna_kod %in% c("gdp", "inflation", "unemployment")
-) %>%
-cols_align(align = "left", columns = Wskaznik)
+  ) %>%
+  tab_options(
+    column_labels.background.color = "#f9f9f9",
+    column_labels.font.weight = "bold",
+    table.font.size = px(14),
+    data_row.padding = px(5),
+    table.border.top.style = "none",
+    table.border.bottom.style = "solid",
+    table.border.bottom.width = px(2),
+    table.border.bottom.color = "black",
+    table.width = pct(100)
+  ) %>%
+  cols_align(align = "left", columns = Wskaznik) %>%
+  cols_align(
+    align = "center",
+    columns = c(N, Srednia, Odch_std, Min, Q1, Mediana, Q3, Max, Zmienna_kod)
+  )
 
 gtsave(statystyki_prezentacja, "../outputs/statystyki_opisowe.png")
+
 ```
 
 ###Analiza trendów
@@ -358,7 +374,6 @@ ranking_turystyka <- df %>%
 ```
 
 ```{r}
-
 ranking_gt <- ranking_turystyka %>%
   gt() %>%
   tab_header(
@@ -370,28 +385,27 @@ ranking_gt <- ranking_turystyka %>%
     Sredni_udzial_PKB = "Średni udział (%)"
   ) %>%
   fmt_number(
-    columns = Sredni_udzial_PKB,
+    Sredni_udzial_PKB,
     decimals = 2,
     dec_mark = ",",
     sep_mark = " "
   ) %>%
-
   tab_options(
-    table.width = pct(50),
-    column_labels.background.color = "#f9f9f9", 
+    column_labels.background.color = "#f9f9f9",
     column_labels.font.weight = "bold",
     table.font.size = px(14),
     data_row.padding = px(5),
     table.border.top.style = "none",
     table.border.bottom.style = "solid",
     table.border.bottom.width = px(2),
-    table.border.bottom.color = "black"
+    table.border.bottom.color = "black",
+    table.width = pct(60)
   ) %>%
   cols_align(align = "left", columns = country) %>%
-  cols_align(align = "center", columns = Sredni_udzial_PKB) %>%
-  opt_row_striping()
+  cols_align(align = "center", columns = Sredni_udzial_PKB)
 
 gtsave(ranking_gt, "../outputs/top_10_udzial_turystyki.png")
+
 ```
 
 ###Trenmdy czasowe

@@ -704,13 +704,19 @@ save_table_png(
 ## Statyczne modele panelowe FE w grupach krajów
 
 ```{r}
+tourism_dep <- tourism_panel %>%
+  group_by(country) %>%
+  summarise(mean_exp = mean(tourism_exports, na.rm = TRUE)) %>%
+  mutate(dep_group = case_when(
+    is.na(mean_exp) ~ NA_character_,
+    mean_exp < 10 ~ "Niska",
+    mean_exp < 20 ~ "Srednia",
+    TRUE ~ "Wysoka"
+  ))
+
 tourism_panel <- tourism_panel %>%
-  group_by(year) %>%
-  mutate(
-    dep_group = ntile(ln_gdp, 3),
-    dep_group = factor(dep_group, levels = 1:3, labels = c("Niski PKB", "Sredni PKB", "Wysoki PKB"))
-  ) %>%
-  ungroup()
+  left_join(tourism_dep %>% select(country, dep_group), by = "country")
+
 ```
 
 ```{r}
@@ -767,6 +773,17 @@ fe_receipts_by_group_tidy <- purrr::imap_dfr(
     )
 )
 
+dep_var_pl <- c(
+  "ln_arrivals" = "Przyjazdy turystów (log)",
+  "ln_receipts" = "Wpływy z turystyki (log)"
+)
+
+dep_group_pl <- c(
+  "Niskie PKB"  = "Niska",
+  "Średnie PKB" = "Średnia",
+  "Wysokie PKB" = "Wysoka"
+)
+
 fe_panel_groups_key <- dplyr::bind_rows(
   fe_arrivals_by_group_tidy,
   fe_receipts_by_group_tidy
@@ -778,7 +795,17 @@ fe_panel_groups_key <- dplyr::bind_rows(
     "ln_tourism_exports",
     "ln_tourism_expenditures"
   )) %>%
-  select(dep_group, dep_var, term, estimate, std.error, statistic, p.value)
+  mutate(
+    dep_var = dplyr::recode(dep_var, !!!dep_var_pl, .default = dep_var),
+    dep_group = dplyr::recode(dep_group, !!!dep_group_pl, .default = dep_group)
+  ) %>%
+  polonizuj_tabele() %>%                           # term/estimate/std.error/statistic/p.value -> PL
+  dplyr::rename(
+    `Grupa krajów` = dep_group,
+    `Zmienna zależna` = dep_var
+  ) %>%
+  dplyr::select(`Grupa krajów`, `Zmienna zależna`, Zmienna,
+                Współczynnik, `Błąd standardowy`, Statystyka, `Wartość p`)
 
 save_table_png(
   fe_panel_groups_key,
@@ -1089,6 +1116,11 @@ if (exists("fit_es_arimax")) {
 
 
 ```{r}
+dep_var_pl <- c(
+  "ln_arrivals" = "Przyjazdy turystów (log)",
+  "ln_receipts" = "Wpływy z turystyki (log)"
+)
+
 ols_fit_stats <- dplyr::bind_rows(
   broom::glance(ols_arrivals) %>%
     dplyr::mutate(dep_var = "ln_arrivals"),
@@ -1096,24 +1128,35 @@ ols_fit_stats <- dplyr::bind_rows(
     dplyr::mutate(dep_var = "ln_receipts")
 ) %>%
   dplyr::select(
-    dep_var,        #zmienna zależna
-    nobs,           #liczba obserwacji
-    r.squared,      #R-kwadrat
-    adj.r.squared,  #skorygowany R-kwadrat
-    sigma,          #błąd standardowy reszt (RSE)
-    AIC,            #kryterium Akaikego
-    BIC             #ryterium Bayesowskie
+    dep_var,
+    nobs,
+    r.squared,
+    adj.r.squared,
+    sigma,
+    AIC,
+    BIC
+  ) %>%
+  dplyr::mutate(
+    dep_var = dplyr::recode(dep_var, !!!dep_var_pl)
+  ) %>%
+  dplyr::rename(
+    `Zmienna zależna` = dep_var,
+    `Liczba obserwacji` = nobs,
+    `R²` = r.squared,
+    `Skorygowane R²` = adj.r.squared,
+    `Sigma (błąd reszt)` = sigma,
+    `AIC` = AIC,
+    `BIC` = BIC
   )
-
 
 print(ols_fit_stats)
 
-
 save_table_png(
-  ols_fit_stats, 
-  "statystyki_dopasowania_ols.csv", 
+  ols_fit_stats,
+  "statystyki_dopasowania_ols.csv",
   title = "Porównanie statystyk dopasowania modeli OLS"
 )
+
 ```
 
 ## Zbiorcza tabela wyników testu Hausmana
@@ -1147,26 +1190,41 @@ save_table_png(
 ## Podsumowanie dopasowania modeli ARIMA dla wybranych krajów
 
 ```{r}
+country_pl <- c(
+  "Poland" = "Polska",
+  "France" = "Francja",
+  "Spain" = "Hiszpania",
+  "United States" = "Stany Zjednoczone"
+)
+
 if (length(ts_models_arrivals) > 0) {
   ts_fit_stats <- purrr::imap_dfr(
     ts_models_arrivals,
     ~ tibble::tibble(
-      country = .y,
-      aic     = AIC(.x),
-      bic     = BIC(.x),
-      loglik  = as.numeric(logLik(.x))
+      kraj = .y,
+      AIC  = AIC(.x),
+      BIC  = BIC(.x),
+      logL = as.numeric(logLik(.x))
     )
   ) %>%
-
-    dplyr::arrange(aic)
+    dplyr::mutate(
+      kraj = dplyr::recode(kraj, !!!country_pl, .default = kraj)
+    ) %>%
+    dplyr::arrange(AIC) %>%
+    dplyr::rename(
+      `Kraj` = kraj,
+      `AIC` = AIC,
+      `BIC` = BIC,
+      `logL (log-wiarygodność)` = logL
+    )
 
   print(ts_fit_stats)
 
-
   save_table_png(
-    ts_fit_stats, 
-    "statystyki_dopasowania_arima.csv", 
+    ts_fit_stats,
+    "statystyki_dopasowania_arima.csv",
     title = "Statystyki dopasowania modeli ARIMA dla poszczególnych krajów"
   )
 }
+
 ```
