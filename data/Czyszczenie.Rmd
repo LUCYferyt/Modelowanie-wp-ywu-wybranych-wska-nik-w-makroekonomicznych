@@ -211,16 +211,60 @@ if (nrow(countries_shock_imputed_old) > 0) {
 Zastosowano interpolację liniową w celu uzupełnienia brakujących wartości w szeregach czasowych dla wybranych wskaźników.
 
 ```{r}
-vars_to_interp <- c("tourism_receipts", "tourism_arrivals", "tourism_exports", 
-                    "tourism_expenditures", "gdp", "inflation")
+vars_to_interp <- c(
+  "tourism_receipts", "tourism_arrivals", "tourism_exports",
+  "tourism_expenditures", "gdp", "inflation"
+)
 
-tourism_clean <- tourism_clean %>%
-  mutate(across(all_of(vars_to_interp), as.numeric)) %>% 
+shock_years <- c(2020, 2021)   
+max_gap_years <- 3            
+
+
+tourism_base <- tourism_clean %>%
+  arrange(country_code, year)
+
+tourism_clean <- tourism_base %>%
+  mutate(across(all_of(vars_to_interp), as.numeric)) %>%
   group_by(country, country_code) %>%
   arrange(year, .by_group = TRUE) %>%
-  mutate(across(all_of(vars_to_interp), 
-                ~ na.approx(., x = year, na.rm = FALSE))) %>%
-  ungroup()
+  mutate(
+    shock = year %in% shock_years,
+    block = cumsum(lag(shock, default = FALSE)) + 1
+  ) %>%
+  group_by(country, country_code, block) %>%
+  mutate(
+    across(all_of(vars_to_interp), ~{
+      x0 <- as.numeric(.)
+      x_hidden <- ifelse(shock, NA_real_, x0)
+
+      x_fill <- zoo::na.approx(
+        x_hidden, x = year, na.rm = FALSE, maxgap = max_gap_years
+      )
+
+      x_out <- ifelse(is.na(x0), x_fill, x0)
+
+      ifelse(shock, x0, x_out)
+    })
+  ) %>%
+  ungroup() %>%
+  select(-shock, -block)
+
+
+imputed_in_shock <- tourism_base %>%
+  select(country_code, year, all_of(vars_to_interp)) %>%
+  pivot_longer(all_of(vars_to_interp), names_to = "var", values_to = "base") %>%
+  left_join(
+    tourism_clean %>%
+      select(country_code, year, all_of(vars_to_interp)) %>%
+      pivot_longer(all_of(vars_to_interp), names_to = "var", values_to = "filled"),
+    by = c("country_code", "year", "var")
+  ) %>%
+  filter(year %in% shock_years) %>%
+  summarise(n = sum(is.na(base) & !is.na(filled), na.rm = TRUE)) %>%
+  pull(n)
+
+print(paste("Liczba wartości dopisanych w latach szoku:", imputed_in_shock))
+
 ```
 
 ###Analiza skuteczności czyszczenia danych.

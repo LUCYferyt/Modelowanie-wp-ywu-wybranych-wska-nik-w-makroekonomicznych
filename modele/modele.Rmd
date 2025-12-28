@@ -34,67 +34,80 @@ label_var <- function(x) dplyr::recode(x, !!!var_pl, .default = x)
 
 
 polish_term <- function(term) {
-  if (is.na(term)) return(term)
-  if (term == "(Intercept)") return("Wyraz wolny")
+  term <- trimws(term)
+  term <- sub("^[A-Za-z0-9_.]+::", "", term)  # usuwa np. plm::lag(...)
 
   if (grepl("^lag\\(", term)) {
-    inside <- sub("^lag\\((.*)\\)$", "\\1", term)
+    inside <- sub("^lag\\(|\\)$", "", term)
     parts <- strsplit(inside, ",")[[1]]
+
     v <- trimws(parts[1])
-    k <- trimws(parts[2])
-    v_lab <- polish_term(v)
-    return(paste0("Opóźniona zmienna: ", v_lab, " (t-", k, ")"))
+    k <- suppressWarnings(as.integer(trimws(parts[2])))
+
+    # jeśli w lag siedzi ln_..., zdejmij ln_
+    v_base <- if (grepl("^ln_", v)) sub("^ln_", "", v) else v
+
+    # specjalne etykiety dla Twoich zmiennych zależnych
+    if (v_base == "arrivals") {
+      lab <- "Przyjazdy turystów"
+    } else if (v_base == "receipts") {
+      lab <- "Wpływy z turystyki"
+    } else {
+      lab <- label_var(v_base)
+    }
+
+    if (!is.na(k)) return(paste0("Opóźnione ", lab, " (t-", k, ")"))
+    return(paste0("Opóźnione ", lab))
   }
 
   if (grepl("^lag_d_", term)) {
     base <- sub("^lag_d_", "", term)
-    return(paste0("Opóźniona zmiana: ", polish_term(base), " (t-1)"))
+    base <- sub("^ln_", "", base)
+    if (base == "arrivals") return("Opóźniona dynamika przyjazdów turystów")
+    if (base == "receipts") return("Opóźniona dynamika wpływów z turystyki")
+    return(paste0("Opóźniona dynamika ", label_var(base)))
   }
 
   if (grepl("^d_ln_", term)) {
     base <- sub("^d_ln_", "", term)
-    base_lab <- label_var(base)
-    return(paste0("Zmiana ", base_lab, " (log)"))
-  }
-  if (grepl("^d_", term)) {
-    base <- sub("^d_", "", term)
-    base_lab <- label_var(base)
-    return(paste0("Zmiana ", base_lab))
+    if (base == "arrivals") return("Dynamika przyjazdów turystów")
+    if (base == "receipts") return("Dynamika wpływów z turystyki")
+    return(paste0("Dynamika ", label_var(base)))
   }
 
   if (grepl("^ln_", term)) {
     base <- sub("^ln_", "", term)
-    base_lab <- label_var(base)
-    return(paste0(base_lab, " (log)"))
+    if (base == "arrivals") return("Przyjazdy turystów (log)")
+    if (base == "receipts") return("Wpływy z turystyki (log)")
+    return(paste0(label_var(base), " (log)"))
   }
 
-  return(label_var(term))
+  label_var(term)
 }
+
 
 polonizuj_tabele <- function(df) {
-  df2 <- df
-
-  if ("term" %in% names(df2)) {
-    df2 <- df2 %>%
-      mutate(Zmienna = vapply(term, polish_term, character(1))) %>%
-      select(-term) %>%
-      select(Zmienna, everything())
+  if ("term" %in% names(df)) {
+    df <- df %>% dplyr::mutate(term = sapply(term, polish_term))
+  }
+  if ("Zmienna" %in% names(df)) {
+    df <- df %>% dplyr::mutate(Zmienna = sapply(Zmienna, polish_term))
   }
 
-  df2 <- df2 %>%
-    rename_with(~ gsub("^estimate$", "Współczynnik", .x)) %>%
-    rename_with(~ gsub("^std\\.error$", "Błąd standardowy", .x)) %>%
-    rename_with(~ gsub("^statistic$", "Statystyka", .x)) %>%
-    rename_with(~ gsub("^p\\.value$", "Wartość p", .x)) %>%
-    rename_with(~ gsub("^Estimate$", "Współczynnik", .x)) %>%
-    rename_with(~ gsub("^Std\\. Error$", "Błąd standardowy", .x)) %>%
-    rename_with(~ gsub("^t-value$", "Statystyka t", .x)) %>%
-    rename_with(~ gsub("^z-value$", "Statystyka z", .x)) %>%
-    rename_with(~ gsub("^Pr\\(>\\|t\\|\\)$", "Wartość p", .x)) %>%
-    rename_with(~ gsub("^Pr\\(>\\|z\\|\\)$", "Wartość p", .x))
-
-  df2
+  df %>%
+    dplyr::rename_with(~ dplyr::recode(
+      .x,
+      "term" = "Zmienna",
+      "estimate" = "Współczynnik",
+      "std.error" = "Błąd standardowy",
+      "statistic" = "Statystyka",
+      "p.value" = "Wartość p",
+      "Wspolczynnik" = "Współczynnik",
+      "Blad standardowy" = "Błąd standardowy",
+      "Wartosc p" = "Wartość p"
+    ))
 }
+
 var_scale <- c(
   gdp = 1e9,
   tourism_receipts = 1e9,
